@@ -1,0 +1,5 @@
+{
+  "name": "Agrifirm AI Planner",
+  "description": "AI-driven event scheduling tool using genetic algorithms to optimize advisor preferences against room capacity constraints.",
+  "requestFramePermissions": []
+}
