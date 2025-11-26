@@ -1,3 +1,4 @@
+
 export enum SessionType {
   PLENARY = 'PLENARY',
   MANDATORY = 'MANDATORY',
@@ -26,6 +27,11 @@ export interface TimeSlot {
   title?: string; // For fixed events like "Lunch"
 }
 
+export interface SessionConstraints {
+  allowedDays: number[]; // [1] for Wed, [2] for Thu, [1,2] for both
+  timeOfDay: 'morning' | 'afternoon' | 'any';
+}
+
 export interface Session {
   id: number;
   title: string;
@@ -34,6 +40,8 @@ export interface Session {
   repeats: number; // How many times it is given (1 or 4)
   fixedSlot?: number; // If pre-assigned to a slot
   durationMinutes: number;
+  targetSize?: number; // From Excel 'aantal/zaal' - guideline for room filling
+  constraints?: SessionConstraints; // From Excel 'moment' column
 }
 
 export interface Advisor {
@@ -60,6 +68,8 @@ export interface ScheduleResult {
     mandatoryMetPercent: number;
     capacityViolations: number;
     unfilledSlots: number;
-    minSizeViolations: number; // Groups < 7
+    minSizeViolations: number; // Groups < targetSize
+    preferenceMetPercent: number;
+    duplicatesFound: number; // New validation metric
   };
 }

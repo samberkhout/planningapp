@@ -1,477 +1,1062 @@
-import { Advisor, Room, ScheduledInstance, Session, SessionType, SlotType, ScheduleResult, TimeSlot } from '../types';
 
-// --- Constants ---
-const MIN_ATTENDEES_PER_SESSION = 7;
+import {
+  Advisor,
+  Room,
+  ScheduledInstance,
+  Session,
+  SlotType,
+  ScheduleResult,
+  TimeSlot,
+  SessionType
+} from '../types';
 
-// --- Helper Functions ---
-const shuffle = <T,>(array: T[]): T[] => {
-  return [...array].sort(() => Math.random() - 0.5);
+// ===================
+// GENETIC ALGORITHM CONFIG
+// ===================
+
+const GA_CONFIG = {
+  POPULATION_SIZE: 200,
+  ELITISM_COUNT: 10,
+  MUTATION_RATE: 0.15,
+  MAX_GENERATIONS: 5000,
+  TIME_LIMIT_MS: 180000, // 3 minutes
+
+  // Fitness Weights
+  WEIGHTS: {
+    CAPACITY_VIOLATION: -50000, // Critical
+    MANDATORY_MISSING: -100000, // Critical - Highest Priority
+    SPEAKER_CONFLICT: -50000,   // (Nog niet expliciet gebruikt, maar gereserveerd)
+    DUPLICATE_SLOT: -50000,
+    UNFILLED_SLOT: -5000,
+    PREFERENCE_MET: 100,
+    MIN_SIZE_VIOLATION: -10,
+    DUPLICATE_SESSION: -100000 // New strict penalty for doing same session twice
+  }
 };
 
-// --- Phase 0: Analyze Demand ---
-const calculateSessionDemand = (advisors: Advisor[], sessions: Session[]): Map<number, number> => {
-    const demand = new Map<number, number>();
-    sessions.forEach(s => demand.set(s.id, 0)); // Init at 0
+export type ProgressCallback = (
+  data: { iteration: number; maxIterations: number; stats: any }
+) => void;
 
-    advisors.forEach(adv => {
-        adv.preferences.forEach((sessId, index) => {
-            const current = demand.get(sessId) || 0;
-            // Weight top choices heavily
-            const weight = index < 3 ? 5 : 1; 
-            demand.set(sessId, current + weight);
-        });
-    });
-    return demand;
+// ===================
+// TYPE DEFINITIONS
+// ===================
+
+interface Gene {
+  sessionId: number;
+  slotId: number;
+  roomId: string;
+}
+
+// Map<AdvisorId, Map<SlotId, Gene>>
+type Genome = Map<number, Map<number, Gene>>;
+
+interface Individual {
+  genome: Genome;
+  fitness: number;
+  stats: any;
+  instances: ScheduledInstance[];
+}
+
+type MutationMode = 'MANDATORY_FIX' | 'CAPACITY_FIX' | 'FILL_SLOT' | 'RANDOM_SWAP';
+
+// ===================
+// HELPER FUNCTIONS
+// ===================
+
+const getStrictCapacity = (
+  roomId: string,
+  sessionId: number,
+  slotId: number,
+  roomsById: Map<string, Room>,
+  slotsById: Map<number, TimeSlot>,
+  sessions: Session[]
+): number => {
+  const room = roomsById.get(roomId);
+  const slot = slotsById.get(slotId);
+
+  if (!room || !slot) return 0;
+
+  // 1. Molenhoek Rule (Plenary only)
+  if (roomId === 'molenhoek') {
+    return sessionId === 46 ? 300 : 0;
+  }
+
+  // 2. Thursday Restrictions
+  if (slot.day === 2 && roomId === 'kinderdijk') {
+    return 0;
+  }
+
+  // 3. Mandatory Session Exception
+  // STRICT RULE: Only MANDATORY sessions get 32. Electives stay at 27.
+  const session = sessions.find(s => s.id === sessionId);
+  if (session && session.type === SessionType.MANDATORY && room.capacity <= 27) {
+    return 32;
+  }
+
+  // Default to room capacity
+  return room.capacity;
 };
 
-// --- Phase 1: Master Schedule Generation ---
-const generateSmartMasterSchedule = (
-  sessions: Session[], 
-  timeSlots: TimeSlot[], 
+// ===================
+// MASTER SCHEDULE GENERATOR
+// ===================
+
+const generateSmartMasterOptions = (
+  sessions: Session[],
   rooms: Room[],
-  advisors: Advisor[]
+  timeSlots: TimeSlot[],
+  fixedInstances: Partial<ScheduledInstance>[],
+  roomsById: Map<string, Room>,
+  slotsById: Map<number, TimeSlot>
 ): ScheduledInstance[] => {
-  const instances: ScheduledInstance[] = [];
+  const masterOptions: ScheduledInstance[] = [];
   let instanceCounter = 0;
-  const occupied = new Set<string>(); // "slotId_roomId"
-  const markOccupied = (slotId: number, roomId: string) => occupied.add(`${slotId}_${roomId}`);
-  const isOccupied = (slotId: number, roomId: string) => occupied.has(`${slotId}_${roomId}`);
-
-  const demandMap = calculateSessionDemand(advisors, sessions);
-
-  // 1. Plenary (Fixed)
-  const plenary = sessions.find(s => s.type === SessionType.PLENARY);
-  let plenarySlotId = -1;
-  if (plenary) {
-    plenarySlotId = plenary.fixedSlot || 2;
-    const roomId = 'molenhoek'; 
-    instances.push({
-      instanceId: `inst-${++instanceCounter}`,
-      sessionId: plenary.id,
-      slotId: plenarySlotId,
-      roomId: roomId,
-      attendees: []
-    });
-    markOccupied(plenarySlotId, roomId);
-  }
-
   const sessionSlots = timeSlots
-    .filter(ts => ts.type === SlotType.SESSION && ts.id !== plenarySlotId)
+    .filter(ts => ts.type === SlotType.SESSION)
     .map(ts => ts.id);
-  
-  const parallelRooms = rooms.filter(r => r.id !== 'molenhoek'); 
 
-  // 2. Mandatory Sessions (Spread efficiently)
-  const mandatorySessions = sessions.filter(s => s.type === SessionType.MANDATORY);
-  // We need enough capacity for everyone to attend every mandatory session
-  const targetMandatoryCap = Math.ceil(advisors.length * 1.05); 
+  // Track usage: Map<SlotId, Set<RoomId>>
+  const usedSlots = new Map<number, Set<string>>();
+  sessionSlots.forEach(sid => usedSlots.set(sid, new Set()));
 
-  for (const session of mandatorySessions) {
-    let currentCapacity = 0;
-    // Try to spread them out over different slots
-    let availableSlots = shuffle([...sessionSlots]);
-    let slotIndex = 0;
+  const markUsed = (slotId: number, roomId: string) => {
+    const s = usedSlots.get(slotId);
+    if (s) s.add(roomId);
+  };
 
-    while (currentCapacity < targetMandatoryCap) {
-      if (availableSlots.length === 0) availableSlots = shuffle([...sessionSlots]);
-      const slotId = availableSlots[slotIndex % availableSlots.length];
-      slotIndex++;
+  const isUsed = (slotId: number, roomId: string) => {
+    return usedSlots.get(slotId)?.has(roomId);
+  };
 
-      // Sort rooms: Mandatories usually need bigger rooms, but we use what fits
-      const sortedRooms = shuffle([...parallelRooms]).sort((a,b) => b.capacity - a.capacity);
-      
-      const freeRoom = sortedRooms.find(r => !isOccupied(slotId, r.id));
-
-      if (freeRoom) {
-        instances.push({
-          instanceId: `inst-${++instanceCounter}`,
-          sessionId: session.id,
-          slotId: slotId,
-          roomId: freeRoom.id,
-          attendees: []
-        });
-        markOccupied(slotId, freeRoom.id);
-        currentCapacity += freeRoom.capacity;
-      }
-      
-      // Safety break
-      if (instances.length > 500) break; 
+  // 1. Load Fixed Instances (from Excel)
+  fixedInstances.forEach(fi => {
+    if (fi.sessionId && fi.roomId && fi.slotId) {
+      masterOptions.push({
+        instanceId: `inst-${++instanceCounter}`,
+        sessionId: fi.sessionId,
+        roomId: fi.roomId,
+        slotId: fi.slotId,
+        attendees: []
+      });
+      markUsed(fi.slotId, fi.roomId);
     }
-  }
-
-  // 3. Electives (Demand Driven)
-  const electives = sessions.filter(s => s.type === SessionType.ELECTIVE);
-  
-  // Filter out electives with extremely low demand to prevent small groups automatically
-  // If only 3 people want it, don't schedule it. They will be forced to pick something else.
-  const viableElectives = electives.filter(s => (demandMap.get(s.id) || 0) >= 7);
-
-  // Create a "Bag" of electives proportional to demand
-  const electiveBag: Session[] = [];
-  viableElectives.forEach(s => {
-      const score = demandMap.get(s.id) || 0;
-      // Add to bag multiple times based on popularity
-      const count = Math.ceil(score / 20); // Arbitrary scaling
-      for(let i=0; i<Math.max(1, count); i++) electiveBag.push(s);
   });
 
-  // Fill remaining space in the grid
-  for (const slotId of sessionSlots) {
-      const occupiedInSlot = instances.filter(i => i.slotId === slotId).length;
-      const roomsAvailable = parallelRooms.filter(r => !isOccupied(slotId, r.id));
-      
-      // CRITICAL UPDATE: Always fill ALL available rooms to ensure maximum seating capacity.
-      // If the weighted bag runs out, fallback to ANY elective.
-      // This ensures 188+ seats for 108 advisors, guaranteeing 0 missing lectures.
-      for (const room of roomsAvailable) {
-          
-          let session: Session;
-          
-          if (electiveBag.length > 0) {
-            // Pick random elective from weighted bag
-            session = electiveBag[Math.floor(Math.random() * electiveBag.length)];
-          } else {
-             // Fallback: Pick any elective to keep the room open
-             session = electives[Math.floor(Math.random() * electives.length)];
-          }
-          
-          instances.push({
+  // 1.5 FORCE PLENARY (Session 46 -> Slot 2 (Lezing 1) -> Molenhoek)
+  const plenarySessions = sessions.filter(s => s.type === SessionType.PLENARY);
+  plenarySessions.forEach(sess => {
+      // Slot 2 is defined as Lezing 1 (08.15 - 09.15)
+      // Check if it's already there from fixedInstances
+      const existing = masterOptions.find(m => m.sessionId === sess.id && m.slotId === 2);
+      if (!existing) {
+          masterOptions.push({
             instanceId: `inst-${++instanceCounter}`,
-            sessionId: session.id,
-            slotId: slotId,
-            roomId: room.id,
+            sessionId: sess.id,
+            roomId: 'molenhoek',
+            slotId: 2,
             attendees: []
           });
-          markOccupied(slotId, room.id);
+          markUsed(2, 'molenhoek');
       }
+  });
+
+
+  // 2. Place Mandatory Sessions
+  const mandatorySessions = sessions.filter(s => s.type === SessionType.MANDATORY);
+
+  mandatorySessions.forEach(sess => {
+    const existing = masterOptions.filter(m => m.sessionId === sess.id).length;
+    let needed = sess.repeats - existing;
+
+    if (needed > 0) {
+      const possibleSlots = sessionSlots.filter(sid => {
+        const s = slotsById.get(sid);
+        return s?.day === 1; // Force Day 1
+      });
+
+      const largeRooms = [...rooms]
+        .sort((a, b) => b.capacity - a.capacity)
+        .filter(r => r.id !== 'molenhoek');
+
+      for (const slotId of possibleSlots) {
+        if (needed <= 0) break;
+
+        for (const room of largeRooms) {
+          if (needed <= 0) break;
+          if (!isUsed(slotId, room.id)) {
+            if (getStrictCapacity(room.id, sess.id, slotId, roomsById, slotsById, sessions) > 0) {
+              masterOptions.push({
+                instanceId: `inst-${++instanceCounter}`,
+                sessionId: sess.id,
+                roomId: room.id,
+                slotId: slotId,
+                attendees: []
+              });
+              markUsed(slotId, room.id);
+              needed--;
+            }
+          }
+        }
+      }
+    }
+  });
+
+  // 3. Place Electives
+  const electiveSessions = sessions.filter(s => s.type === SessionType.ELECTIVE);
+  let electiveIdx = 0;
+
+  const shuffledSlots = [...sessionSlots].sort(() => Math.random() - 0.5);
+
+  shuffledSlots.forEach(slotId => {
+    const roomsInSlot = rooms.filter(r => r.id !== 'molenhoek');
+    const availableRooms = roomsInSlot.filter(r => !isUsed(slotId, r.id));
+
+    availableRooms.sort(() => Math.random() - 0.5);
+
+    availableRooms.forEach(room => {
+      let placed = false;
+      let attempts = 0;
+
+      while (!placed && attempts < electiveSessions.length) {
+        const sess = electiveSessions[electiveIdx % electiveSessions.length];
+        electiveIdx++;
+        attempts++;
+
+        const sData = slotsById.get(slotId);
+        if (sess.constraints && sData) {
+          if (
+            sess.constraints.allowedDays.length > 0 &&
+            !sess.constraints.allowedDays.includes(sData.day)
+          )
+            continue;
+          if (
+            sess.constraints.timeOfDay === 'morning' &&
+            !(
+              sData.label.startsWith('08') ||
+              sData.label.startsWith('09') ||
+              sData.label.startsWith('10') ||
+              sData.label.startsWith('11')
+            )
+          )
+            continue;
+          if (
+            sess.constraints.timeOfDay === 'afternoon' &&
+            (sData.label.startsWith('08') || sData.label.startsWith('09') || sData.label.startsWith('10'))
+          )
+            continue;
+        }
+
+        const currentCount = masterOptions.filter(m => m.sessionId === sess.id).length;
+
+        // Use repeats directly, slightly over-provision to allow swaps
+        if (currentCount < Math.ceil(sess.repeats * 1.1)) {
+           // Capacity check is implicit, we assume standard rooms fit electives
+           masterOptions.push({
+              instanceId: `inst-${++instanceCounter}`,
+              sessionId: sess.id,
+              roomId: room.id,
+              slotId: slotId,
+              attendees: []
+            });
+            markUsed(slotId, room.id);
+            placed = true;
+        }
+      }
+    });
+  });
+
+  return masterOptions;
+};
+
+// ===================
+// BULLDOZER / POST-PROCESSOR
+// ===================
+
+const refineScheduleWithBulldozer = (
+  ind: Individual,
+  advisors: Advisor[],
+  sessions: Session[],
+  masterOptions: ScheduledInstance[],
+  roomsById: Map<string, Room>,
+  slotsById: Map<number, TimeSlot>
+) => {
+  const isBusy = (advId: number, slotId: number) => {
+    const genes = ind.genome.get(advId);
+    return genes ? genes.has(slotId) : false;
+  };
+
+  const isAttendingSession = (advId: number, sessionId: number) => {
+      const genes = ind.genome.get(advId);
+      if (!genes) return false;
+      for (const g of genes.values()) {
+          if (g.sessionId === sessionId) return true;
+      }
+      return false;
+  };
+
+  const removeGene = (advId: number, slotId: number) => {
+    const g = ind.genome.get(advId);
+    if (g && g.has(slotId)) {
+      const gene = g.get(slotId)!;
+      g.delete(slotId);
+      const inst = ind.instances.find(
+        i => i.slotId === slotId && i.roomId === gene.roomId
+      );
+      if (inst) inst.attendees = inst.attendees.filter(a => a !== advId);
+    }
+  };
+
+  const addGene = (advId: number, inst: ScheduledInstance) => {
+    removeGene(advId, inst.slotId);
+    const g = ind.genome.get(advId)!;
+    g.set(inst.slotId, {
+      sessionId: inst.sessionId,
+      roomId: inst.roomId,
+      slotId: inst.slotId
+    });
+    inst.attendees.push(advId);
+  };
+
+  // PHASE 1: FORCE MANDATORY (AND PLENARY)
+  // Include Plenary in the mandatory enforcement loop
+  const mandatorySessions = sessions.filter(s => s.type === SessionType.MANDATORY || s.type === SessionType.PLENARY);
+  
+  advisors.forEach(adv => {
+    mandatorySessions.forEach(ms => {
+      const genes = ind.genome.get(adv.id);
+      let attending = false;
+      if (genes) {
+        for (const gene of genes.values()) {
+          if (gene.sessionId === ms.id) attending = true;
+        }
+      }
+
+      if (!attending) {
+        const instances = ind.instances.filter(i => i.sessionId === ms.id);
+
+        // Sort by available capacity
+        instances.sort((a, b) => {
+          const capA = getStrictCapacity(
+            a.roomId,
+            a.sessionId,
+            a.slotId,
+            roomsById,
+            slotsById,
+            sessions
+          );
+          const capB = getStrictCapacity(
+            b.roomId,
+            b.sessionId,
+            b.slotId,
+            roomsById,
+            slotsById,
+            sessions
+          );
+          return (capB - b.attendees.length) - (capA - a.attendees.length);
+        });
+
+        let assigned = false;
+
+        // 1. Try free slot
+        for (const inst of instances) {
+          if (!isBusy(adv.id, inst.slotId)) {
+            const cap = getStrictCapacity(
+              inst.roomId,
+              inst.sessionId,
+              inst.slotId,
+              roomsById,
+              slotsById,
+              sessions
+            );
+            if (inst.attendees.length < cap) {
+              addGene(adv.id, inst);
+              assigned = true;
+              break;
+            }
+          }
+        }
+
+        // 2. Kick out elective
+        if (!assigned) {
+          for (const inst of instances) {
+            const currentGene = ind.genome.get(adv.id)?.get(inst.slotId);
+            // We can overwrite if current is elective OR nothing
+            if (
+              !currentGene ||
+              sessions.find(s => s.id === currentGene.sessionId)?.type === SessionType.ELECTIVE
+            ) {
+              addGene(adv.id, inst);
+              assigned = true;
+              break;
+            }
+          }
+        }
+
+        // 3. Last resort - overwrite anything that isn't another mandatory
+        if (!assigned && instances.length > 0) {
+           const inst = instances[0];
+           const currentGene = ind.genome.get(adv.id)?.get(inst.slotId);
+           const currentSession = currentGene ? sessions.find(s => s.id === currentGene.sessionId) : null;
+           
+           if (!currentSession || (currentSession.type !== SessionType.MANDATORY && currentSession.type !== SessionType.PLENARY)) {
+               addGene(adv.id, inst);
+           }
+        }
+      }
+    });
+  });
+
+  // PHASE 2: FILL HOLES
+  const sessionSlots = Array.from(slotsById.values())
+    .filter(s => s.type === SlotType.SESSION)
+    .map(s => s.id);
+
+  advisors.forEach(adv => {
+    const genes = ind.genome.get(adv.id)!;
+
+    sessionSlots.forEach(slotId => {
+      // Check if advisor is speaking in this slot
+      const isSpeaker = sessions.some(
+        s =>
+          s.speaker &&
+          s.speaker.toLowerCase().split(/[\/&+,]| en /i).some(part => adv.name.toLowerCase().includes(part.trim())) &&
+          ind.instances.some(i => i.sessionId === s.id && i.slotId === slotId)
+      );
+      if (isSpeaker) return;
+
+      if (!genes.has(slotId)) {
+        const possible = ind.instances.filter(i => i.slotId === slotId);
+        
+        // Only consider sessions the advisor is NOT already attending elsewhere
+        const validOptions = possible.filter(i => !isAttendingSession(adv.id, i.sessionId));
+
+        const withSpace = validOptions.filter(
+          i =>
+            i.attendees.length <
+            getStrictCapacity(i.roomId, i.sessionId, i.slotId, roomsById, slotsById, sessions)
+        );
+
+        if (withSpace.length > 0) {
+          // Optimization: Pick preferred if available
+          const pref = withSpace.find(i => adv.preferences.includes(i.sessionId));
+          const choice = pref || withSpace[0];
+          genes.set(slotId, {
+            sessionId: choice.sessionId,
+            roomId: choice.roomId,
+            slotId: choice.slotId
+          });
+          choice.attendees.push(adv.id);
+        } else if (validOptions.length > 0) {
+          // Force fill if needed (ignoring capacity for a moment to ensure 0 missing, AI will fix later or error remains)
+          // Actually, let's respect capacity but try harder next loop. 
+          // Bulldozer override: Pick the one with most space available (least negative capacity)
+           const bestOption = validOptions.sort((a,b) => a.attendees.length - b.attendees.length)[0];
+           genes.set(slotId, {
+            sessionId: bestOption.sessionId,
+            roomId: bestOption.roomId,
+            slotId: bestOption.slotId
+          });
+          bestOption.attendees.push(adv.id);
+        }
+      }
+    });
+  });
+};
+
+// ===================
+// FITNESS
+// ===================
+
+const calculateFitness = (
+  ind: Individual,
+  advisors: Advisor[],
+  sessions: Session[],
+  roomsById: Map<string, Room>,
+  slotsById: Map<number, TimeSlot>
+): number => {
+  let score = 0;
+
+  ind.stats = {
+    mandatoryMetPercent: 0,
+    capacityViolations: 0,
+    unfilledSlots: 0,
+    preferenceMetPercent: 0,
+    minSizeViolations: 0,
+    duplicatesFound: 0
+  };
+
+  let totalMandatoryNeeded = 0;
+  let totalMandatoryMet = 0;
+  let totalPreferences = 0;
+  let metPreferences = 0;
+  let filledSlots = 0;
+
+  // Include PLENARY in mandatory checks
+  const mandatory = sessions.filter(s => s.type === SessionType.MANDATORY || s.type === SessionType.PLENARY);
+  const sessionSlotsCount = Array.from(slotsById.values()).filter(
+    s => s.type === SlotType.SESSION
+  ).length;
+
+  advisors.forEach(adv => {
+    const genes = ind.genome.get(adv.id);
+    const attendingIds = new Set<number>();
+    
+    // Check for duplicates
+    if (genes) {
+      genes.forEach(g => {
+          if (attendingIds.has(g.sessionId)) {
+              score += GA_CONFIG.WEIGHTS.DUPLICATE_SESSION;
+              ind.stats.duplicatesFound++;
+          }
+          attendingIds.add(g.sessionId);
+      });
+      filledSlots += genes.size;
+    }
+
+    mandatory.forEach(m => {
+      totalMandatoryNeeded++;
+      if (attendingIds.has(m.id)) {
+        totalMandatoryMet++;
+      } else {
+        score += GA_CONFIG.WEIGHTS.MANDATORY_MISSING;
+      }
+    });
+
+    // KPI: Preference Score (Adjusted for max possible slots)
+    // Max slots a person can fill is sessionSlotsCount - mandatory.length (approx)
+    // But practically, it's just min(preferences.length, slots_attended_elective)
+    // Let's keep it simple: matches / total_preferences.
+    // IMPROVED: matches / min(preferences.length, available_elective_slots)
+    // For now, let's stick to standard percentage but be lenient.
+    
+    // Better KPI:
+    const possibleElectiveSlots = Math.max(0, sessionSlotsCount - mandatory.length);
+    const maxMatchable = Math.min(adv.preferences.length, possibleElectiveSlots);
+    
+    if (maxMatchable > 0) {
+        let personalMet = 0;
+        adv.preferences.forEach(p => {
+            if (attendingIds.has(p)) personalMet++;
+        });
+        
+        // Add to global counter relative to max possible
+        metPreferences += personalMet;
+        totalPreferences += maxMatchable; // Normalize against what was possible
+        
+        score += (personalMet * GA_CONFIG.WEIGHTS.PREFERENCE_MET);
+    }
+  });
+
+  ind.instances.forEach(inst => {
+    const cap = getStrictCapacity(
+      inst.roomId,
+      inst.sessionId,
+      inst.slotId,
+      roomsById,
+      slotsById,
+      sessions
+    );
+    if (inst.attendees.length > cap) {
+      const diff = inst.attendees.length - cap;
+      ind.stats.capacityViolations += diff;
+      score += diff * GA_CONFIG.WEIGHTS.CAPACITY_VIOLATION;
+    }
+  });
+
+  let actualUnfilled = 0;
+  advisors.forEach(adv => {
+    const genes = ind.genome.get(adv.id);
+    // Speaker logic: if speaker, they are 'busy' but no gene. 
+    // We assume masterOptions has speaker constraint handled or we count presenting as filled.
+    // For simplicity here, we just count genes. 
+    // Ideally we subtract slots where they present.
+    
+    const presentingCount = sessions.filter(s => 
+        s.speaker && s.speaker.toLowerCase().includes(adv.name.toLowerCase())
+    ).length; 
+    // This is rough, assumes 1 slot per presentation.
+    
+    const target = Math.max(0, sessionSlotsCount - presentingCount);
+    
+    if (genes && genes.size < target) {
+      actualUnfilled += (target - genes.size);
+    }
+  });
+  
+  ind.stats.unfilledSlots = actualUnfilled;
+  if (actualUnfilled > 0) {
+    score += actualUnfilled * GA_CONFIG.WEIGHTS.UNFILLED_SLOT;
   }
+
+  ind.stats.mandatoryMetPercent =
+    totalMandatoryNeeded > 0 ? (totalMandatoryMet / totalMandatoryNeeded) * 100 : 100;
+    
+  // Adjusted Preference KPI
+  ind.stats.preferenceMetPercent =
+    totalPreferences > 0 ? (metPreferences / totalPreferences) * 100 : 100;
+
+  ind.fitness = score;
+  return score;
+};
+
+// ===================
+// INSTANCE BUILDER
+// ===================
+
+const buildInstancesFromGenome = (
+  genome: Genome,
+  masterOptions: ScheduledInstance[]
+): ScheduledInstance[] => {
+  const instances = masterOptions.map(m => ({
+    ...m,
+    attendees: [] as number[]
+  }));
+
+  genome.forEach((slotMap, advId) => {
+    slotMap.forEach(gene => {
+      const inst = instances.find(
+        i =>
+          i.sessionId === gene.sessionId &&
+          i.slotId === gene.slotId &&
+          i.roomId === gene.roomId
+      );
+      if (inst) {
+        inst.attendees.push(advId);
+      }
+    });
+  });
 
   return instances;
 };
 
+// ===================
+// RANDOM INDIVIDUAL
+// ===================
 
-// --- Phase 2: Assignment Logic ---
-const runSinglePass = (
-  advisors: Advisor[], 
-  sessions: Session[], 
-  timeSlots: TimeSlot[], 
-  rooms: Room[]
-): ScheduleResult => {
-  
-  let masterSchedule = generateSmartMasterSchedule(sessions, timeSlots, rooms, advisors);
-  
-  const activeSessionSlots = timeSlots.filter(ts => ts.type === SlotType.SESSION).map(ts => ts.id);
-  const TOTAL_SLOTS = activeSessionSlots.length; // Maximaal vullen target
+const createRandomIndividual = (
+  advisors: Advisor[],
+  masterOptions: ScheduledInstance[],
+  sessions: Session[],
+  slotsById: Map<number, TimeSlot>
+): Individual => {
+  const genome: Genome = new Map();
+  const sessionSlots = Array.from(slotsById.values())
+    .filter(s => s.type === SlotType.SESSION)
+    .map(s => s.id);
 
-  // --- Speaker Detection (Conflict Resolution) ---
-  // Map<AdvisorID, Set<SlotID>> - Slots where this advisor is BUSY speaking
-  const speakerConflicts = new Map<number, Set<number>>();
-  
   advisors.forEach(adv => {
-      // Improved matching: Split speakers by separators and check exact inclusion
-      // This handles "Fokko Prins & Jan Ties Malda" correctly finding "Fokko Prins"
-      const speakingSessions = sessions.filter(s => {
-          if (!s.speaker) return false;
-          // Split by common separators: "/", "&", "+", ",", " en "
-          const parts = s.speaker.split(/[\/&+,]| en /i).map(p => p.trim().toLowerCase());
-          const advName = adv.name.toLowerCase();
-          
-          return parts.some(part => part.includes(advName) || advName.includes(part));
-      });
-      
-      if (speakingSessions.length > 0) {
-          const busySlots = new Set<number>();
-          speakingSessions.forEach(s => {
-              // Find when this session is scheduled in master schedule
-              const scheduledTimes = masterSchedule.filter(i => i.sessionId === s.id).map(i => i.slotId);
-              scheduledTimes.forEach(slotId => busySlots.add(slotId));
+    const advGenes = new Map<number, Gene>();
+    const pickedSessions = new Set<number>();
+
+    sessionSlots.forEach(slotId => {
+      const options = masterOptions.filter(i => i.slotId === slotId);
+      if (options.length > 0) {
+        // Try to pick preference that hasn't been picked yet
+        let choice = options.find(o => adv.preferences.includes(o.sessionId) && !pickedSessions.has(o.sessionId));
+        
+        if (!choice) {
+          // Random valid choice not picked
+          const valid = options.filter(o => !pickedSessions.has(o.sessionId));
+          if (valid.length > 0) {
+             choice = valid[Math.floor(Math.random() * valid.length)];
+          }
+        }
+
+        const isSpeaker = sessions.some(
+          s =>
+            s.speaker &&
+            s.speaker.toLowerCase().includes(adv.name.toLowerCase()) &&
+            s.id === choice?.sessionId
+        );
+
+        if (!isSpeaker && choice) {
+          advGenes.set(slotId, {
+            sessionId: choice.sessionId,
+            slotId,
+            roomId: choice.roomId
           });
-          speakerConflicts.set(adv.id, busySlots);
+          pickedSessions.add(choice.sessionId);
+        }
       }
+    });
+
+    genome.set(adv.id, advGenes);
   });
 
-
-  // Quick Lookup Helpers
-  const getRoomCap = (rid: string) => rooms.find(r => r.id === rid)?.capacity || 0;
-  const isFull = (inst: ScheduledInstance) => inst.attendees.length >= getRoomCap(inst.roomId);
-  const getAdvisorSchedule = (advId: number) => masterSchedule.filter(i => i.attendees.includes(advId));
-  
-  // "Busy" now includes: 
-  // 1. Attending another session
-  // 2. Presenting a session (Conflict)
-  const isBusyAt = (advId: number, slotId: number) => {
-      const attending = getAdvisorSchedule(advId).some(i => i.slotId === slotId);
-      if (attending) return true;
-      
-      const speakingSlots = speakerConflicts.get(advId);
-      if (speakingSlots && speakingSlots.has(slotId)) return true;
-      
-      return false;
-  };
-
-  // Count activities: Attending + Speaking
-  const getActivityCount = (advId: number) => {
-      const attending = getAdvisorSchedule(advId).length;
-      const speakingSlots = speakerConflicts.get(advId);
-      const speaking = speakingSlots ? speakingSlots.size : 0;
-      return attending + speaking;
-  };
-
-  // A. PLENARY (Must Attend - unless presenting)
-  const plenaryInst = masterSchedule.find(i => sessions.find(s => s.id === i.sessionId)?.type === SessionType.PLENARY);
-  if (plenaryInst) {
-      advisors.forEach(adv => {
-          if (!isFull(plenaryInst) && !isBusyAt(adv.id, plenaryInst.slotId)) {
-              plenaryInst.attendees.push(adv.id);
-          }
-      });
-  }
-
-  // B. MANDATORY (Must Attend 5)
-  const mandatoryIds = sessions.filter(s => s.type === SessionType.MANDATORY).map(s => s.id);
-  
-  for (const advisor of shuffle(advisors)) {
-      for (const mid of mandatoryIds) {
-          // If already attending OR speaking this specific mandatory session
-          if (getAdvisorSchedule(advisor.id).some(i => i.sessionId === mid)) continue;
-          
-          // If they are the speaker of this session, they don't need to attend it as a participant
-          const isSpeakerForThis = sessions.find(s => s.id === mid)?.speaker.toLowerCase().includes(advisor.name.toLowerCase());
-          if (isSpeakerForThis) continue;
-
-          const candidates = masterSchedule.filter(i => i.sessionId === mid && !isFull(i) && !isBusyAt(advisor.id, i.slotId));
-          if (candidates.length > 0) {
-              candidates.sort((a,b) => b.attendees.length - a.attendees.length);
-              candidates[0].attendees.push(advisor.id);
-          }
-      }
-  }
-
-  // C. PREFERENCES (Electives)
-  for (let rank = 0; rank < 15; rank++) {
-      for (const advisor of shuffle(advisors)) {
-          // REMOVED CAP: if (getActivityCount(advisor.id) >= TARGET_SESSIONS_PER_USER) continue;
-
-          const prefId = advisor.preferences[rank];
-          if (!prefId) continue;
-          if (getAdvisorSchedule(advisor.id).some(i => i.sessionId === prefId)) continue;
-
-          const candidates = masterSchedule.filter(i => i.sessionId === prefId && !isFull(i) && !isBusyAt(advisor.id, i.slotId));
-          
-          if (candidates.length > 0) {
-              candidates.sort((a,b) => b.attendees.length - a.attendees.length);
-              candidates[0].attendees.push(advisor.id);
-          }
-      }
-  }
-
-  // D. GAP FILLING (Maximize Fullness) - Force assignments to ANY slot that is empty
-  for (const advisor of shuffle(advisors)) {
-      // Find all empty slots for this advisor
-      const myInstances = getAdvisorSchedule(advisor.id);
-      const busySlots = new Set(myInstances.map(i => i.slotId));
-      
-      const speakerBusy = speakerConflicts.get(advisor.id);
-      if (speakerBusy) speakerBusy.forEach(s => busySlots.add(s));
-
-      // Slots where the advisor does NOTHING yet
-      const freeSlots = activeSessionSlots.filter(sid => !busySlots.has(sid));
-
-      for (const slotId of freeSlots) {
-          // Try to find ANY non-full session in this slot
-          // Prioritize sessions that already have people (to avoid small groups), then preferences
-          const candidates = masterSchedule.filter(i => 
-              i.slotId === slotId && 
-              !isFull(i) && 
-              !myInstances.some(my => my.sessionId === i.sessionId) // Should be redundant if slots distinct
-          );
-          
-          let bestCandidate: ScheduledInstance | null = null;
-          let bestScore = -999;
-
-          for (const cand of candidates) {
-              let score = 0;
-              // Prioritize joining existing groups
-              if (cand.attendees.length > 0) score += 50; 
-              // Heavily prioritize filling small groups to reach min size
-              if (cand.attendees.length < MIN_ATTENDEES_PER_SESSION && cand.attendees.length > 0) score += 100; 
-              // Slight bonus if it happens to be a preference (even if lower rank)
-              if (advisor.preferences.includes(cand.sessionId)) score += 10;
-              
-              if (score > bestScore) {
-                  bestScore = score;
-                  bestCandidate = cand;
-              }
-          }
-
-          if (bestCandidate) {
-              bestCandidate.attendees.push(advisor.id);
-          }
-          // If no candidate found (all rooms full?), slot remains empty -> "???" in export
-      }
-  }
-
-  // E. CLEANUP: DISSOLVE SMALL GROUPS
-  let changed = true;
-  let loops = 0;
-  while(changed && loops < 3) {
-      changed = false;
-      loops++;
-      const smallGroups = masterSchedule.filter(i => i.attendees.length > 0 && i.attendees.length < MIN_ATTENDEES_PER_SESSION);
-      
-      for (const group of smallGroups) {
-          const members = [...group.attendees];
-          const keptMembers: number[] = [];
-
-          for (const memberId of members) {
-              // Find alternative in same slot
-              const alts = masterSchedule.filter(i => 
-                  i.slotId === group.slotId && 
-                  i.instanceId !== group.instanceId && 
-                  !isFull(i) &&
-                  !getAdvisorSchedule(memberId).some(my => my.sessionId === i.sessionId) 
-              );
-              
-              alts.sort((a,b) => b.attendees.length - a.attendees.length);
-
-              if (alts.length > 0) {
-                  alts[0].attendees.push(memberId);
-                  changed = true;
-              } else {
-                  keptMembers.push(memberId);
-              }
-          }
-          group.attendees = keptMembers;
-      }
-  }
-
-  // F. FORCE RECRUITMENT
-  const stubbornSmallGroups = masterSchedule.filter(i => i.attendees.length > 0 && i.attendees.length < MIN_ATTENDEES_PER_SESSION);
-  for (const group of stubbornSmallGroups) {
-      const needed = MIN_ATTENDEES_PER_SESSION - group.attendees.length;
-      let recruited = 0;
-      
-      const potentialRecruits = shuffle(advisors).filter(a => 
-          !isBusyAt(a.id, group.slotId) && 
-          !getAdvisorSchedule(a.id).some(i => i.sessionId === group.sessionId)
-      );
-
-      for (const recruit of potentialRecruits) {
-          if (recruited >= needed) break;
-          if (isFull(group)) break;
-          
-          group.attendees.push(recruit.id);
-          recruited++;
-      }
-  }
-
-  // Final Cleanup
-  masterSchedule = masterSchedule.filter(i => i.attendees.length > 0);
-
-
-  // --- Metrics Calculation ---
-  let totalMandatoryCount = 0;
-  let capacityViolations = 0;
-  let totalRankSum = 0;
-  let usersWithIncompleteSchedule = 0;
-  let lowAttendanceSessions = 0;
-
-  advisors.forEach(adv => {
-      const myInsts = masterSchedule.filter(i => i.attendees.includes(adv.id));
-      const mySessionIds = myInsts.map(i => i.sessionId);
-      const speakingSlots = speakerConflicts.get(adv.id);
-      
-      // Mandatory Check
-      mandatoryIds.forEach(mid => {
-          if (mySessionIds.includes(mid)) totalMandatoryCount++;
-          // Treat speaking as "Attending" for metric purposes so we don't penalize speakers
-          else if (sessions.find(s => s.id === mid)?.speaker.toLowerCase().includes(adv.name.toLowerCase())) {
-              totalMandatoryCount++;
-          }
-      });
-
-      const activityCount = myInsts.length + (speakingSlots ? speakingSlots.size : 0);
-      // Metric: Should ideally match TOTAL_SLOTS (everything filled)
-      if (activityCount < TOTAL_SLOTS) {
-          usersWithIncompleteSchedule += (TOTAL_SLOTS - activityCount); // Count total empty slots across all users
-      }
-
-      // Rank Check
-      myInsts.forEach(inst => {
-          const sess = sessions.find(s => s.id === inst.sessionId);
-          if (sess?.type === SessionType.ELECTIVE) {
-              const idx = adv.preferences.indexOf(sess.id);
-              if (idx !== -1) totalRankSum += (idx + 1);
-              else totalRankSum += 20;
-          }
-      });
-  });
-
-  masterSchedule.forEach(inst => {
-      if (inst.attendees.length > getRoomCap(inst.roomId)) capacityViolations++;
-      if (inst.attendees.length < MIN_ATTENDEES_PER_SESSION) lowAttendanceSessions++;
-  });
-
-  const mandatoryTotalPossible = advisors.length * mandatoryIds.length;
-  const mandatoryMetPercent = mandatoryTotalPossible > 0 ? (totalMandatoryCount / mandatoryTotalPossible) * 100 : 0;
-  const avgRank = totalRankSum / (advisors.length * 10); // Approx denom
-
-  let fitness = 0;
-  fitness += (mandatoryMetPercent * 10000);
-  fitness -= (capacityViolations * 100000);
-  fitness -= (lowAttendanceSessions * 5000);
-  fitness -= (usersWithIncompleteSchedule * 500); // Increased penalty for missing lectures
-  fitness -= avgRank;
-
-  return {
-    instances: masterSchedule,
-    advisors,
-    fitness,
-    stats: {
-      mandatoryMetPercent,
-      averagePreferenceRank: avgRank,
-      capacityViolations,
-      unfilledSlots: usersWithIncompleteSchedule, // Now represents TOTAL empty slots across all users
-      minSizeViolations: lowAttendanceSessions
-    }
-  };
+  const instances = buildInstancesFromGenome(genome, masterOptions);
+  return { genome, fitness: 0, stats: {}, instances };
 };
 
-export const solveSchedule = async (
-  advisors: Advisor[], 
-  sessions: Session[], 
-  timeSlots: TimeSlot[], 
-  rooms: Room[]
-): Promise<ScheduleResult> => {
+// ===================
+// CROSSOVER
+// ===================
 
-  const START_TIME = Date.now();
-  const MAX_DURATION_MS = 15000; // Increased to 15 seconds to "keep trying"
-  const MAX_ITERATIONS = 2000; // Increased significantly to find the perfect fit
+const crossoverIndividuals = (
+  p1: Individual,
+  p2: Individual,
+  advisors: Advisor[],
+  masterOptions: ScheduledInstance[]
+): Individual => {
+  const childGenome: Genome = new Map();
 
-  let bestResult: ScheduleResult | null = null;
-  let iterations = 0;
+  advisors.forEach(adv => {
+    const g1 = p1.genome.get(adv.id);
+    const g2 = p2.genome.get(adv.id);
 
-  console.log(`Starting Robust Solver with Max Fill Logic...`);
+    const childMap = new Map<number, Gene>();
+    const allSlots = new Set<number>();
 
-  while (iterations < MAX_ITERATIONS) {
-    iterations++;
-    if (Date.now() - START_TIME > MAX_DURATION_MS && bestResult) break;
+    if (g1) g1.forEach((_, slotId) => allSlots.add(slotId));
+    if (g2) g2.forEach((_, slotId) => allSlots.add(slotId));
 
-    const result = runSinglePass(advisors, sessions, timeSlots, rooms);
+    allSlots.forEach(slotId => {
+      const gene1 = g1?.get(slotId);
+      const gene2 = g2?.get(slotId);
 
-    if (!bestResult || result.fitness > bestResult.fitness) {
-      bestResult = result;
+      let chosen: Gene | undefined;
+      const r = Math.random();
+
+      if (gene1 && gene2) {
+        chosen = r < 0.5 ? gene1 : gene2;
+      } else if (gene1 || gene2) {
+        chosen = gene1 ?? gene2!;
+      } else {
+        chosen = undefined;
+      }
+
+      if (chosen) {
+        childMap.set(slotId, { ...chosen });
+      }
+    });
+
+    childGenome.set(adv.id, childMap);
+  });
+
+  const childInstances = buildInstancesFromGenome(childGenome, masterOptions);
+  return { genome: childGenome, instances: childInstances, fitness: 0, stats: {} };
+};
+
+// ===================
+// SMART MUTATION
+// ===================
+
+const mutateIndividual = (
+  ind: Individual,
+  advisors: Advisor[],
+  sessions: Session[],
+  roomsById: Map<string, Room>,
+  slotsById: Map<number, TimeSlot>,
+  masterOptions: ScheduledInstance[],
+  mutationRate: number
+) => {
+  if (Math.random() > mutationRate) return;
+
+  calculateFitness(ind, advisors, sessions, roomsById, slotsById);
+
+  const overfullInstances = ind.instances.filter(inst => {
+    const cap = getStrictCapacity(
+      inst.roomId,
+      inst.sessionId,
+      inst.slotId,
+      roomsById,
+      slotsById,
+      sessions
+    );
+    return inst.attendees.length > cap;
+  });
+
+  const sessionSlots = Array.from(slotsById.values())
+    .filter(s => s.type === SlotType.SESSION)
+    .map(s => s.id);
+
+  const hasMandatoryProblem = ind.stats.mandatoryMetPercent < 100;
+  const hasCapacityProblem = overfullInstances.length > 0;
+  const hasUnfilledSlots = ind.stats.unfilledSlots > 0;
+
+  const mutationChoice: MutationMode = hasMandatoryProblem
+    ? 'MANDATORY_FIX'
+    : hasCapacityProblem
+    ? 'CAPACITY_FIX'
+    : hasUnfilledSlots
+    ? 'FILL_SLOT'
+    : 'RANDOM_SWAP';
+
+  switch (mutationChoice) {
+    case 'MANDATORY_FIX': {
+      const mandatorySessions = sessions.filter(s => s.type === SessionType.MANDATORY || s.type === SessionType.PLENARY);
+      const rndAdv = advisors[Math.floor(Math.random() * advisors.length)];
+      const genes = ind.genome.get(rndAdv.id);
+      if (!genes) break;
+
+      const attending = new Set(Array.from(genes.values()).map(g => g.sessionId));
+      const missing = mandatorySessions.filter(m => !attending.has(m.id));
+      if (missing.length === 0) break;
+
+      const target = missing[Math.floor(Math.random() * missing.length)];
+      const instances = ind.instances.filter(i => i.sessionId === target.id);
+      if (instances.length === 0) break;
+
+      const chosenInst = instances[Math.floor(Math.random() * instances.length)];
+
+      genes.set(chosenInst.slotId, {
+        sessionId: chosenInst.sessionId,
+        roomId: chosenInst.roomId,
+        slotId: chosenInst.slotId
+      });
+      chosenInst.attendees.push(rndAdv.id);
+      break;
     }
 
-    if (result.stats.mandatoryMetPercent >= 99.9 && 
-        result.stats.capacityViolations === 0 &&
-        result.stats.unfilledSlots === 0 &&
-        result.stats.minSizeViolations === 0) {
-      console.log(`Perfect solution found in ${iterations} iterations.`);
-      break; 
+    case 'CAPACITY_FIX': {
+      const inst = overfullInstances[Math.floor(Math.random() * overfullInstances.length)];
+      const advId = inst.attendees[Math.floor(Math.random() * inst.attendees.length)];
+      const genes = ind.genome.get(advId);
+      if (!genes) break;
+
+      genes.delete(inst.slotId);
+      inst.attendees = inst.attendees.filter(a => a !== advId);
+
+      const altOptions = ind.instances.filter(i => i.slotId === inst.slotId);
+      const feasible = altOptions.filter(o => {
+        const cap = getStrictCapacity(
+          o.roomId,
+          o.sessionId,
+          o.slotId,
+          roomsById,
+          slotsById,
+          sessions
+        );
+        return o.attendees.length < cap;
+      });
+
+      if (feasible.length > 0) {
+        const choice = feasible[Math.floor(Math.random() * feasible.length)];
+        genes.set(choice.slotId, {
+          sessionId: choice.sessionId,
+          roomId: choice.roomId,
+          slotId: choice.slotId
+        });
+        choice.attendees.push(advId);
+      }
+      break;
+    }
+
+    case 'FILL_SLOT': {
+      const adv = advisors[Math.floor(Math.random() * advisors.length)];
+      const genes = ind.genome.get(adv.id);
+      if (!genes) break;
+
+      const emptySlots = sessionSlots.filter(sid => !genes.has(sid));
+      if (emptySlots.length === 0) break;
+
+      const slotId = emptySlots[Math.floor(Math.random() * emptySlots.length)];
+      const options = ind.instances.filter(i => i.slotId === slotId);
+
+      const feasible = options.filter(o => {
+        const cap = getStrictCapacity(
+          o.roomId,
+          o.sessionId,
+          o.slotId,
+          roomsById,
+          slotsById,
+          sessions
+        );
+        return o.attendees.length < cap;
+      });
+
+      if (feasible.length === 0) break;
+
+      const pref = feasible.find(o => adv.preferences.includes(o.sessionId));
+      const choice = pref || feasible[Math.floor(Math.random() * feasible.length)];
+
+      genes.set(slotId, {
+        sessionId: choice.sessionId,
+        roomId: choice.roomId,
+        slotId: choice.slotId
+      });
+      choice.attendees.push(adv.id);
+      break;
+    }
+
+    case 'RANDOM_SWAP': {
+      const slotId = sessionSlots[Math.floor(Math.random() * sessionSlots.length)];
+      const adv1 = advisors[Math.floor(Math.random() * advisors.length)];
+      const adv2 = advisors[Math.floor(Math.random() * advisors.length)];
+      if (adv1.id === adv2.id) break;
+
+      const g1 = ind.genome.get(adv1.id);
+      const g2 = ind.genome.get(adv2.id);
+      if (!g1 || !g2) break;
+
+      const gene1 = g1.get(slotId);
+      const gene2 = g2.get(slotId);
+      if (!gene1 && !gene2) break;
+
+      if (gene2) {
+        g1.set(slotId, { ...gene2 });
+      } else {
+        g1.delete(slotId);
+      }
+
+      if (gene1) {
+        g2.set(slotId, { ...gene1 });
+      } else {
+        g2.delete(slotId);
+      }
+      break;
     }
   }
-  
-  console.log("Solver finished.");
-  return bestResult!;
+};
+
+// ===================
+// LOCAL SEARCH (MEMETIC STEP)
+// ===================
+
+const localSearch = (
+  ind: Individual,
+  advisors: Advisor[],
+  sessions: Session[],
+  masterOptions: ScheduledInstance[],
+  roomsById: Map<string, Room>,
+  slotsById: Map<number, TimeSlot>
+) => {
+  refineScheduleWithBulldozer(ind, advisors, sessions, masterOptions, roomsById, slotsById);
+  calculateFitness(ind, advisors, sessions, roomsById, slotsById);
+};
+
+// ===================
+// GENETIC ALGORITHM CORE
+// ===================
+
+export const solveSchedule = async (
+  advisors: Advisor[],
+  sessions: Session[],
+  timeSlots: TimeSlot[],
+  rooms: Room[],
+  fixedInstances: Partial<ScheduledInstance>[],
+  onProgress?: ProgressCallback
+): Promise<ScheduleResult> => {
+  const roomsById = new Map(rooms.map(r => [r.id, r]));
+  const slotsById = new Map(timeSlots.map(s => [s.id, s]));
+
+  // 1. Generate Master Schedule
+  const masterOptions = generateSmartMasterOptions(
+    sessions,
+    rooms,
+    timeSlots,
+    fixedInstances,
+    roomsById,
+    slotsById
+  );
+
+  // 2. Initialize Population
+  let population: Individual[] = [];
+  for (let i = 0; i < GA_CONFIG.POPULATION_SIZE; i++) {
+    const ind = createRandomIndividual(advisors, masterOptions, sessions, slotsById);
+    calculateFitness(ind, advisors, sessions, roomsById, slotsById);
+    population.push(ind);
+  }
+
+  const startTime = Date.now();
+  let generation = 0;
+
+  let currentMutationRate = GA_CONFIG.MUTATION_RATE;
+  let lastBestFitness = -Infinity;
+  let stagnationCounter = 0;
+
+  const TOP_K_LOCAL_SEARCH = 5;
+
+  while (
+    generation < GA_CONFIG.MAX_GENERATIONS &&
+    Date.now() - startTime < GA_CONFIG.TIME_LIMIT_MS
+  ) {
+    population.sort((a, b) => b.fitness - a.fitness);
+
+    for (let i = 0; i < Math.min(TOP_K_LOCAL_SEARCH, population.length); i++) {
+      localSearch(population[i], advisors, sessions, masterOptions, roomsById, slotsById);
+    }
+
+    population.sort((a, b) => b.fitness - a.fitness);
+
+    if (population[0].fitness <= lastBestFitness) {
+      stagnationCounter++;
+    } else {
+      stagnationCounter = 0;
+      lastBestFitness = population[0].fitness;
+    }
+
+    if (stagnationCounter > 20) {
+      currentMutationRate = Math.min(0.5, currentMutationRate * 1.5);
+    } else {
+      currentMutationRate = GA_CONFIG.MUTATION_RATE;
+    }
+
+    if (generation % 10 === 0 && onProgress) {
+      onProgress({
+        iteration: generation,
+        maxIterations: GA_CONFIG.MAX_GENERATIONS,
+        stats: population[0].stats
+      });
+      await new Promise(r => setTimeout(r, 0));
+    }
+
+    const newPop: Individual[] = population.slice(0, GA_CONFIG.ELITISM_COUNT);
+
+    while (newPop.length < GA_CONFIG.POPULATION_SIZE) {
+      const p1 = population[Math.floor(Math.random() * (GA_CONFIG.POPULATION_SIZE / 2))];
+      const p2 = population[Math.floor(Math.random() * GA_CONFIG.POPULATION_SIZE)];
+
+      let child = crossoverIndividuals(p1, p2, advisors, masterOptions);
+
+      mutateIndividual(
+        child,
+        advisors,
+        sessions,
+        roomsById,
+        slotsById,
+        masterOptions,
+        currentMutationRate
+      );
+
+      calculateFitness(child, advisors, sessions, roomsById, slotsById);
+      newPop.push(child);
+    }
+
+    population = newPop;
+    generation++;
+  }
+
+  population.sort((a, b) => b.fitness - a.fitness);
+  const best = population[0];
+
+  // STRICT REPAIR LOOP: Run until mandatory is 100% and missing is 0
+  let repairAttempts = 0;
+  const SAFE_BREAK_LIMIT = 200; 
+
+  while (
+    repairAttempts < SAFE_BREAK_LIMIT &&
+    (best.stats.mandatoryMetPercent < 100 || best.stats.unfilledSlots > 0 || best.stats.capacityViolations > 0)
+  ) {
+    refineScheduleWithBulldozer(best, advisors, sessions, masterOptions, roomsById, slotsById);
+    calculateFitness(best, advisors, sessions, roomsById, slotsById);
+
+    if (onProgress && repairAttempts % 5 === 0) {
+      onProgress({
+        iteration: GA_CONFIG.MAX_GENERATIONS + repairAttempts,
+        maxIterations: GA_CONFIG.MAX_GENERATIONS + SAFE_BREAK_LIMIT,
+        stats: best.stats
+      });
+      await new Promise(r => setTimeout(r, 0));
+    }
+
+    repairAttempts++;
+  }
+
+  return {
+    instances: best.instances,
+    advisors,
+    fitness: best.fitness,
+    stats: best.stats
+  };
 };

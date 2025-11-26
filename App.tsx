@@ -1,9 +1,9 @@
+
 import React, { useState } from 'react';
-import { ROOMS, TIME_SLOTS as DEFAULT_TIME_SLOTS } from './constants';
-import { solveSchedule } from './services/aiSolver';
+import { solveSchedule, ProgressCallback } from './services/aiSolver';
 import { generateAndDownloadZip } from './services/exportService';
 import { parseExcelFile } from './services/excelService';
-import { Advisor, ScheduleResult, Session, TimeSlot } from './types';
+import { Advisor, ScheduleResult, Session, TimeSlot, ScheduledInstance, Room } from './types';
 import ScheduleView from './components/ScheduleView';
 import StatsCard from './components/StatsCard';
 
@@ -20,7 +20,9 @@ const App: React.FC = () => {
   // State for Data - Start Empty
   const [advisors, setAdvisors] = useState<Advisor[]>([]);
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [timeSlots, setTimeSlots] = useState<TimeSlot[]>(DEFAULT_TIME_SLOTS);
+  const [timeSlots, setTimeSlots] = useState<TimeSlot[]>([]);
+  const [rooms, setRooms] = useState<Room[]>([]);
+  const [fixedInstances, setFixedInstances] = useState<Partial<ScheduledInstance>[]>([]);
   
   // State for Logic
   const [result, setResult] = useState<ScheduleResult | null>(null);
@@ -29,6 +31,7 @@ const App: React.FC = () => {
   const [selectedAdvisorId, setSelectedAdvisorId] = useState<number | null>(null);
   const [isFileUploaded, setIsFileUploaded] = useState(false);
   const [uploadError, setUploadError] = useState<string|null>(null);
+  const [progress, setProgress] = useState<{ iteration: number, maxIterations: number, stats: any } | null>(null);
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -40,6 +43,9 @@ const App: React.FC = () => {
       setAdvisors(data.advisors);
       setSessions(data.sessions);
       setTimeSlots(data.timeSlots); 
+      setRooms(data.rooms);
+      if (data.fixedInstances) setFixedInstances(data.fixedInstances);
+
       setIsFileUploaded(true);
       setResult(null); // Reset previous result
     } catch (e: any) {
@@ -50,15 +56,24 @@ const App: React.FC = () => {
 
   const handleRunAlgorithm = async () => {
     setIsSolving(true);
+    setProgress(null);
     // Allow UI render cycle to show loading state before blocking main thread
     setTimeout(async () => {
       try {
-        const solution = await solveSchedule(advisors, sessions, timeSlots, ROOMS);
+        const solution = await solveSchedule(
+            advisors, 
+            sessions, 
+            timeSlots, 
+            rooms, 
+            fixedInstances,
+            (p) => setProgress(p)
+        );
         setResult(solution);
       } catch(e) {
         console.error(e);
       } finally {
         setIsSolving(false);
+        setProgress(null);
       }
     }, 100);
   };
@@ -67,7 +82,7 @@ const App: React.FC = () => {
     if (!result) return;
     setIsExporting(true);
     try {
-      await generateAndDownloadZip(result, sessions, timeSlots);
+      await generateAndDownloadZip(result, sessions, timeSlots, rooms);
     } catch (e) {
       console.error("Export failed", e);
       alert("Failed to generate export.");
@@ -126,6 +141,7 @@ const App: React.FC = () => {
                             <li>{advisors.length} Adviseurs ingeladen</li>
                             <li>{sessions.length} Lezingen gevonden</li>
                             <li>{timeSlots.length} Tijdsloten herkend</li>
+                            <li>{rooms.length} Zalen gevonden</li>
                         </ul>
                     </div>
                  ) : (
@@ -137,10 +153,66 @@ const App: React.FC = () => {
                   disabled={!isFileUploaded}
                   className={`px-8 py-3 rounded-lg font-bold shadow w-full ${!isFileUploaded ? 'bg-gray-300 text-gray-500 cursor-not-allowed' : 'bg-agriGreen text-white hover:bg-green-700'}`}
                  >
-                   Start Planning Algoritme (Iteratief)
+                   Start Planning Algoritme (Extra Optimalisatie)
                  </button>
                </div>
              </div>
+          )}
+
+          {/* Loading Progress Modal */}
+          {isSolving && (
+            <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 backdrop-blur-sm">
+                <div className="bg-white p-8 rounded-2xl shadow-2xl max-w-md w-full animate-pulse-slow">
+                    <h3 className="text-xl font-bold mb-4 text-agriGreen text-center">Planning Genereren...</h3>
+                    
+                    {progress ? (
+                        <div className="mb-6">
+                            <div className="flex justify-between text-xs font-mono mb-2 text-gray-500">
+                                <span>Iteratie {progress.iteration}</span>
+                                <span>{Math.round((progress.iteration / progress.maxIterations) * 100)}%</span>
+                            </div>
+                            <div className="w-full bg-gray-100 rounded-full h-3 overflow-hidden">
+                                <div 
+                                    className="bg-agriGreen h-full rounded-full transition-all duration-300 ease-out" 
+                                    style={{ width: `${(progress.iteration / progress.maxIterations) * 100}%` }}
+                                ></div>
+                            </div>
+                            
+                            <div className="mt-6 space-y-3 text-sm border-t border-gray-100 pt-4">
+                                <div className="flex justify-between items-center">
+                                    <span className="text-gray-600">Verplicht Behaald</span>
+                                    <span className={`font-mono font-bold ${progress.stats.mandatoryMetPercent === 100 ? 'text-green-600' : 'text-gray-400'}`}>
+                                        {progress.stats.mandatoryMetPercent.toFixed(1)}%
+                                    </span>
+                                </div>
+                                <div className="flex justify-between items-center">
+                                    <span className="text-gray-600">Conflicten</span>
+                                    <span className={`font-mono font-bold ${progress.stats.capacityViolations === 0 ? 'text-green-600' : 'text-red-500'}`}>
+                                        {progress.stats.capacityViolations}
+                                    </span>
+                                </div>
+                                <div className="flex justify-between items-center">
+                                    <span className="text-gray-600">Missende Lezingen</span>
+                                    <span className={`font-mono font-bold ${progress.stats.unfilledSlots === 0 ? 'text-green-600' : 'text-orange-500'}`}>
+                                        {progress.stats.unfilledSlots}
+                                    </span>
+                                </div>
+                                <div className="flex justify-between items-center">
+                                    <span className="text-gray-600">Voorkeuren</span>
+                                    <span className={`font-mono font-bold ${progress.stats.preferenceMetPercent >= 80 ? 'text-green-600' : 'text-blue-500'}`}>
+                                        {progress.stats.preferenceMetPercent.toFixed(1)}%
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="flex justify-center py-8">
+                             <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-agriGreen"></div>
+                        </div>
+                    )}
+                    <p className="text-center text-xs text-gray-400 italic mt-2">Dit kan enkele seconden duren...</p>
+                </div>
+            </div>
           )}
 
           {/* Results Dashboard */}
@@ -169,8 +241,14 @@ const App: React.FC = () => {
                 <StatsCard 
                   title="Te Kleine Groepen" 
                   value={result.stats.minSizeViolations} 
-                  subtext="Groepen < 7"
+                  subtext="Groepen < 15"
                   color={result.stats.minSizeViolations === 0 ? 'green' : 'yellow'}
+                />
+                 <StatsCard 
+                  title="Voorkeuren Score" 
+                  value={`${result.stats.preferenceMetPercent.toFixed(1)}%`} 
+                  subtext="Doel: > 80%"
+                  color={result.stats.preferenceMetPercent > 80 ? 'green' : 'red'}
                 />
                 
                 {/* Export Card */}
@@ -217,7 +295,7 @@ const App: React.FC = () => {
                 selectedAdvisorId={selectedAdvisorId}
                 sessions={sessions}
                 timeSlots={timeSlots}
-                rooms={ROOMS}
+                rooms={rooms}
               />
             </>
           )}

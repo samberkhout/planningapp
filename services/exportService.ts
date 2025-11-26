@@ -1,5 +1,5 @@
-import { ScheduleResult, Session, TimeSlot, Room, SlotType } from '../types';
-import { ROOMS } from '../constants';
+
+import { ScheduleResult, Session, TimeSlot, Room, SlotType, SessionType } from '../types';
 import { generatePresentation } from './presentationService';
 
 declare global {
@@ -42,23 +42,32 @@ const generateExcelChecklist = (
           
           if (instance) {
               const session = sessions.find(s => s.id === instance.sessionId);
-              row.push(session ? `${session.id}. ${session.title}` : 'ERROR');
+              if (session) {
+                  // Check if this was a preference or mandatory
+                  const isMandatory = session.type === SessionType.MANDATORY || session.type === SessionType.PLENARY;
+                  const isPreferred = advisor.preferences.includes(session.id);
+                  
+                  let prefix = "";
+                  // Mark as EXTRA/WARNING only if it is an Elective AND not in preferences
+                  if (!isMandatory && !isPreferred) {
+                      prefix = "⚠️ [NIET GEKOZEN] ";
+                  }
+
+                  row.push(`${prefix}${session.id}. ${session.title}`);
+              } else {
+                  row.push('ERROR');
+              }
           } else {
               // Check if they are PRESENTING in this slot
-              // We need to find a session where they are the speaker, AND that session is scheduled in this slot
-              // Note: We need to look at the master schedule to see when their speaking session is actually scheduled.
-              
-              // 1. Find sessions they speak at
               const mySpeakingSessionIds = presentingSessions.map(s => s.id);
-              // 2. Find when those sessions are happening
               const speakingInstance = result.instances.find(i => i.slotId === slot.id && mySpeakingSessionIds.includes(i.sessionId));
 
               if (speakingInstance) {
+                  // Need to pass ROOMS ideally, but here we just need name
+                  // Since generateExcelChecklist is separate, let's keep it simple or look up later
                   const s = sessions.find(s => s.id === speakingInstance.sessionId);
-                  const room = ROOMS.find(r => r.id === speakingInstance.roomId);
-                  row.push(`ZELF PRESENTEREN: ${s?.title} (${room ? room.name : 'Onbekend'})`);
+                  row.push(`ZELF PRESENTEREN: ${s?.title}`);
               } else {
-                  // Unassigned / Backup needed - This confirms the "Vraagteken" requirement
                   row.push("??? - HANDMATIG INDELEN");
               }
           }
@@ -67,10 +76,8 @@ const generateExcelChecklist = (
   });
 
   const ws = XLSX.utils.aoa_to_sheet(data);
-  
-  // Basic Column Widths
   const wscols = [{wch: 5}, {wch: 30}];
-  sessionSlots.forEach(() => wscols.push({wch: 40}));
+  sessionSlots.forEach(() => wscols.push({wch: 50}));
   ws['!cols'] = wscols;
 
   const wb = XLSX.utils.book_new();
@@ -82,7 +89,8 @@ const generateExcelChecklist = (
 export const generateAndDownloadZip = async (
   result: ScheduleResult, 
   sessions: Session[], 
-  timeSlots: TimeSlot[]
+  timeSlots: TimeSlot[],
+  rooms: Room[]
 ) => {
   const { jsPDF } = window.jspdf;
   const JSZip = window.JSZip;
@@ -98,16 +106,15 @@ export const generateAndDownloadZip = async (
   // 1. PDF Folder
   const folder = zip.folder("Planning_Schedules");
   const getSession = (id: number): Session | undefined => sessions.find(s => s.id === id);
-  const getRoom = (id: string): Room | undefined => ROOMS.find(r => r.id === id);
+  const getRoom = (id: string): Room | undefined => rooms.find(r => r.id === id);
 
   for (const advisor of result.advisors) {
     const doc = new jsPDF();
     
-    // --- Header (Page 1 Only) ---
+    // --- Header ---
     doc.setFontSize(16);
     doc.setTextColor(0, 128, 55); 
     doc.text("Programma-overzicht lezingen", 14, 20);
-    
     doc.setDrawColor(0, 128, 55);
     doc.setLineWidth(0.5);
     doc.line(14, 22, 196, 22);
@@ -116,7 +123,7 @@ export const generateAndDownloadZip = async (
     doc.setTextColor(0, 0, 0);
     doc.text(`Naam: ${advisor.name}`, 14, 30);
 
-    // --- Generate Tables for Each Day ---
+    // --- Tables ---
     const days = [1, 2];
     days.forEach((day, index) => {
         if (index > 0) doc.addPage();
@@ -138,10 +145,8 @@ export const generateAndDownloadZip = async (
                   i.slotId === slot.id && i.attendees.includes(advisor.id)
               );
               
-              // Check if presenting
               const isPresenting = sessions.filter(s => s.speaker && s.speaker.toLowerCase().includes(advisor.name.toLowerCase()))
                                            .some(s => {
-                                              // Is this session scheduled in this slot?
                                               return result.instances.some(i => i.sessionId === s.id && i.slotId === slot.id);
                                            });
 
@@ -157,7 +162,6 @@ export const generateAndDownloadZip = async (
                   ];
               } else if (isPresenting) {
                   const speakingSession = sessions.find(s => s.speaker && s.speaker.toLowerCase().includes(advisor.name.toLowerCase()));
-                   // Need exact instance to get room
                   const speakingInstance = result.instances.find(i => i.slotId === slot.id && i.sessionId === speakingSession?.id);
                   const room = speakingInstance ? getRoom(speakingInstance.roomId) : null;
                   
@@ -169,7 +173,6 @@ export const generateAndDownloadZip = async (
                     "-"
                   ];
               } else {
-                  // Changed text to reflect "Back-up" status instead of just "free time"
                   rowData = [slot.label, "-", "-", "Reserve / Back-up (Handmatig indelen)", "-"];
               }
             } else {
@@ -214,23 +217,22 @@ export const generateAndDownloadZip = async (
     folder.file(`${advisor.name.replace(/ /g, '_')}_Schedule.pdf`, pdfBlob);
   }
 
-  // 2. PowerPoint Presentation
+  // 2. PPT
   try {
-      const pptBlob = await generatePresentation(result, sessions, timeSlots, ROOMS);
+      const pptBlob = await generatePresentation(result, sessions, timeSlots, rooms);
       zip.file("Event_Presentation.pptx", pptBlob);
   } catch (e) {
-      console.error("PPT Generation failed", e);
+      console.error("PPT failed", e);
   }
 
-  // 3. Excel Checklist
+  // 3. Excel
   try {
       const xlsxBuffer = generateExcelChecklist(result, sessions, timeSlots);
       zip.file("Checklist_Overzicht.xlsx", xlsxBuffer);
   } catch (e) {
-      console.error("Excel Generation failed", e);
+      console.error("Excel failed", e);
   }
 
-  // Generate and Download Zip
   const content = await zip.generateAsync({ type: "blob" });
   window.saveAs(content, "Agrifirm_Planning_Package.zip");
 };
