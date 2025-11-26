@@ -190,13 +190,23 @@ const generateSmartMasterOptions = (
   timeSlots: TimeSlot[],
   fixedInstances: Partial<ScheduledInstance>[],
   roomsById: Map<string, Room>,
-  slotsById: Map<number, TimeSlot>
+  slotsById: Map<number, TimeSlot>,
+  advisors: Advisor[]
 ): ScheduledInstance[] => {
   const masterOptions: ScheduledInstance[] = [];
   let instanceCounter = 0;
   const sessionSlots = timeSlots
     .filter(ts => ts.type === SlotType.SESSION)
     .map(ts => ts.id);
+
+  // Preference-aware weighting to place popular electives in larger rooms first
+  const preferenceDemand = new Map<number, number>();
+  advisors.forEach(adv => {
+    adv.preferences.forEach((pref, idx) => {
+      const weight = Math.max(1, adv.preferences.length - idx);
+      preferenceDemand.set(pref, (preferenceDemand.get(pref) ?? 0) + weight);
+    });
+  });
 
   // Track usage: Map<SlotId, Set<RoomId>>
   const usedSlots = new Map<number, Set<string>>();
@@ -286,64 +296,69 @@ const generateSmartMasterOptions = (
 
   // 3. Place Electives
   const electiveSessions = sessions.filter(s => s.type === SessionType.ELECTIVE);
-  let electiveIdx = 0;
+  const electivePlacements = new Map<number, number>();
 
-  const shuffledSlots = [...sessionSlots].sort(() => Math.random() - 0.5);
+  const sortedSlots = [...sessionSlots].sort((a, b) => a - b);
 
-  shuffledSlots.forEach(slotId => {
-    const roomsInSlot = rooms.filter(r => r.id !== 'molenhoek');
+  sortedSlots.forEach(slotId => {
+    const roomsInSlot = rooms.filter(r => r.id !== 'molenhoek').sort((a, b) => b.capacity - a.capacity);
     const availableRooms = roomsInSlot.filter(r => !isUsed(slotId, r.id));
 
-    availableRooms.sort(() => Math.random() - 0.5);
-
     availableRooms.forEach(room => {
-      let placed = false;
-      let attempts = 0;
+      const candidates = electiveSessions
+        .filter(sess => {
+          const placedCount = electivePlacements.get(sess.id) ?? 0;
+          const demandTarget = Math.max(sess.repeats, Math.ceil((preferenceDemand.get(sess.id) ?? 0) / 25));
+          if (placedCount >= Math.ceil(demandTarget * 1.1)) return false;
 
-      while (!placed && attempts < electiveSessions.length) {
-        const sess = electiveSessions[electiveIdx % electiveSessions.length];
-        electiveIdx++;
-        attempts++;
-
-        const sData = slotsById.get(slotId);
-        if (sess.constraints && sData) {
-          if (
-            sess.constraints.allowedDays.length > 0 &&
-            !sess.constraints.allowedDays.includes(sData.day)
-          )
-            continue;
-          if (
-            sess.constraints.timeOfDay === 'morning' &&
-            !(
-              sData.label.startsWith('08') ||
-              sData.label.startsWith('09') ||
-              sData.label.startsWith('10') ||
-              sData.label.startsWith('11')
+          const sData = slotsById.get(slotId);
+          if (sess.constraints && sData) {
+            if (
+              sess.constraints.allowedDays.length > 0 &&
+              !sess.constraints.allowedDays.includes(sData.day)
             )
-          )
-            continue;
-          if (
-            sess.constraints.timeOfDay === 'afternoon' &&
-            (sData.label.startsWith('08') || sData.label.startsWith('09') || sData.label.startsWith('10'))
-          )
-            continue;
-        }
+              return false;
+            if (
+              sess.constraints.timeOfDay === 'morning' &&
+              !(
+                sData.label.startsWith('08') ||
+                sData.label.startsWith('09') ||
+                sData.label.startsWith('10') ||
+                sData.label.startsWith('11')
+              )
+            )
+              return false;
+            if (
+              sess.constraints.timeOfDay === 'afternoon' &&
+              (sData.label.startsWith('08') || sData.label.startsWith('09') || sData.label.startsWith('10'))
+            )
+              return false;
+          }
 
-        const currentCount = masterOptions.filter(m => m.sessionId === sess.id).length;
+          return true;
+        })
+        .sort((a, b) => {
+          const demandA = preferenceDemand.get(a.id) ?? 0;
+          const demandB = preferenceDemand.get(b.id) ?? 0;
+          const placedA = electivePlacements.get(a.id) ?? 0;
+          const placedB = electivePlacements.get(b.id) ?? 0;
 
-        // Use repeats directly, slightly over-provision to allow swaps
-        if (currentCount < Math.ceil(sess.repeats * 1.1)) {
-           // Capacity check is implicit, we assume standard rooms fit electives
-           masterOptions.push({
-              instanceId: `inst-${++instanceCounter}`,
-              sessionId: sess.id,
-              roomId: room.id,
-              slotId: slotId,
-              attendees: []
-            });
-            markUsed(slotId, room.id);
-            placed = true;
-        }
+          const scoreA = demandA / Math.max(1, placedA + 1);
+          const scoreB = demandB / Math.max(1, placedB + 1);
+          return scoreB - scoreA;
+        });
+
+      const best = candidates[0];
+      if (best) {
+        masterOptions.push({
+          instanceId: `inst-${++instanceCounter}`,
+          sessionId: best.id,
+          roomId: room.id,
+          slotId: slotId,
+          attendees: []
+        });
+        markUsed(slotId, room.id);
+        electivePlacements.set(best.id, (electivePlacements.get(best.id) ?? 0) + 1);
       }
     });
   });
@@ -546,6 +561,116 @@ const refineScheduleWithBulldozer = (
       }
     });
   });
+
+  // PHASE 3: Remove duplicate sessions per advisor and refill with best available
+  advisors.forEach(adv => {
+    const genes = ind.genome.get(adv.id)!;
+    const preferenceRank = new Map<number, number>();
+    adv.preferences.forEach((p, idx) => preferenceRank.set(p, idx));
+
+    const seenSessions = new Map<number, number>();
+    genes.forEach((gene, slotId) => {
+      if (seenSessions.has(gene.sessionId)) {
+        removeGene(adv.id, slotId);
+      } else {
+        seenSessions.set(gene.sessionId, slotId);
+      }
+    });
+
+    sessionSlots.forEach(slotId => {
+      if (genes.has(slotId)) return;
+
+      const presenterConflict = presenterObligations.get(slotId)?.some(o => o.advId === adv.id);
+      if (presenterConflict) return;
+
+      const options = ind.instances.filter(
+        i =>
+          i.slotId === slotId &&
+          !seenSessions.has(i.sessionId) &&
+          i.attendees.length <
+            getStrictCapacity(i.roomId, i.sessionId, i.slotId, roomsById, slotsById, sessions)
+      );
+
+      options.sort((a, b) => {
+        const rankA = preferenceRank.get(a.sessionId) ?? Number.MAX_SAFE_INTEGER;
+        const rankB = preferenceRank.get(b.sessionId) ?? Number.MAX_SAFE_INTEGER;
+        return rankA - rankB;
+      });
+
+      const choice = options[0];
+      if (choice) {
+        addGene(adv.id, choice);
+        seenSessions.set(choice.sessionId, slotId);
+      }
+    });
+  });
+
+  // PHASE 4: Rebalance overfull sessions by moving low-preference attendees to open seats
+  const preferenceRanks = new Map<number, Map<number, number>>();
+  advisors.forEach(adv => {
+    const map = new Map<number, number>();
+    adv.preferences.forEach((p, idx) => map.set(p, idx));
+    preferenceRanks.set(adv.id, map);
+  });
+
+  const overfullInstances = ind.instances.filter(inst => {
+    const cap = getStrictCapacity(inst.roomId, inst.sessionId, inst.slotId, roomsById, slotsById, sessions);
+    return inst.attendees.length > cap;
+  });
+
+  overfullInstances.forEach(inst => {
+    const cap = getStrictCapacity(inst.roomId, inst.sessionId, inst.slotId, roomsById, slotsById, sessions);
+    while (inst.attendees.length > cap) {
+      const candidateAdv = [...inst.attendees].sort((a, b) => {
+        const rankMapA = preferenceRanks.get(a);
+        const rankMapB = preferenceRanks.get(b);
+        const rankA = rankMapA?.get(inst.sessionId) ?? Number.MAX_SAFE_INTEGER;
+        const rankB = rankMapB?.get(inst.sessionId) ?? Number.MAX_SAFE_INTEGER;
+        return rankB - rankA;
+      })[0];
+
+      if (candidateAdv === undefined) break;
+
+      const presenterConflict = presenterObligations.get(inst.slotId)?.some(o => o.advId === candidateAdv);
+      if (presenterConflict) break;
+
+      removeGene(candidateAdv, inst.slotId);
+
+      const altOptions = ind.instances
+        .filter(other => {
+          if (other.slotId !== inst.slotId) return false;
+          if (other.sessionId === inst.sessionId) return false;
+          const rank = preferenceRanks.get(candidateAdv)?.get(other.sessionId) ?? Number.MAX_SAFE_INTEGER;
+          const hasSpace =
+            other.attendees.length <
+            getStrictCapacity(other.roomId, other.sessionId, other.slotId, roomsById, slotsById, sessions);
+          return hasSpace && rank !== Number.MAX_SAFE_INTEGER;
+        })
+        .sort((a, b) => {
+          const rankA = preferenceRanks.get(candidateAdv)?.get(a.sessionId) ?? Number.MAX_SAFE_INTEGER;
+          const rankB = preferenceRanks.get(candidateAdv)?.get(b.sessionId) ?? Number.MAX_SAFE_INTEGER;
+          const spaceA =
+            getStrictCapacity(a.roomId, a.sessionId, a.slotId, roomsById, slotsById, sessions) - a.attendees.length;
+          const spaceB =
+            getStrictCapacity(b.roomId, b.sessionId, b.slotId, roomsById, slotsById, sessions) - b.attendees.length;
+          if (rankA !== rankB) return rankA - rankB;
+          return spaceB - spaceA;
+        });
+
+      const fallback = ind.instances.find(
+        other =>
+          other.slotId === inst.slotId &&
+          other.sessionId !== inst.sessionId &&
+          other.attendees.length <
+            getStrictCapacity(other.roomId, other.sessionId, other.slotId, roomsById, slotsById, sessions)
+      );
+
+      const destination = altOptions[0] ?? fallback;
+      if (destination) {
+        addGene(candidateAdv, destination);
+      }
+    }
+  });
 };
 
 // ===================
@@ -723,7 +848,8 @@ const createRandomIndividual = (
   masterOptions: ScheduledInstance[],
   sessions: Session[],
   slotsById: Map<number, TimeSlot>,
-  presenterObligations: Map<number, PresenterObligation[]>
+  presenterObligations: Map<number, PresenterObligation[]>,
+  roomsById: Map<string, Room>
 ): Individual => {
   const genome: Genome = new Map();
   const sessionSlots = Array.from(slotsById.values())
@@ -733,6 +859,32 @@ const createRandomIndividual = (
   const mandatorySessions = sessions.filter(
     s => s.type === SessionType.MANDATORY || s.type === SessionType.PLENARY
   );
+
+  const instanceKey = (inst: ScheduledInstance) => `${inst.sessionId}-${inst.slotId}-${inst.roomId}`;
+  const occupancy = new Map<string, number>();
+
+  const canFit = (inst: ScheduledInstance) => {
+    const cap = getStrictCapacity(
+      inst.roomId,
+      inst.sessionId,
+      inst.slotId,
+      roomsById,
+      slotsById,
+      sessions
+    );
+    return (occupancy.get(instanceKey(inst)) ?? 0) < cap;
+  };
+
+  const reserve = (advId: number, inst: ScheduledInstance, advGenes: Map<number, Gene>) => {
+    if (!canFit(inst)) return false;
+    advGenes.set(inst.slotId, {
+      sessionId: inst.sessionId,
+      slotId: inst.slotId,
+      roomId: inst.roomId
+    });
+    occupancy.set(instanceKey(inst), (occupancy.get(instanceKey(inst)) ?? 0) + 1);
+    return true;
+  };
 
   const obligationsByAdvisor = new Map<number, PresenterObligation[]>();
   presenterObligations.forEach(list => {
@@ -757,6 +909,7 @@ const createRandomIndividual = (
         roomId: ob.roomId
       });
       pickedSessions.add(ob.sessionId);
+      occupancy.set(`${ob.sessionId}-${ob.slotId}-${ob.roomId}`, (occupancy.get(`${ob.sessionId}-${ob.slotId}-${ob.roomId}`) ?? 0) + 1);
     });
 
     // Reserve mandatory and plenary sessions first
@@ -767,13 +920,10 @@ const createRandomIndividual = (
         .sort((a, b) => a.slotId - b.slotId);
 
       if (instances.length > 0) {
-        const inst = instances[0];
-        advGenes.set(inst.slotId, {
-          sessionId: inst.sessionId,
-          slotId: inst.slotId,
-          roomId: inst.roomId
-        });
-        pickedSessions.add(inst.sessionId);
+        const inst = instances.find(i => canFit(i)) ?? instances[0];
+        if (reserve(adv.id, inst, advGenes)) {
+          pickedSessions.add(inst.sessionId);
+        }
       }
     });
 
@@ -802,12 +952,14 @@ const createRandomIndividual = (
       );
 
       if (!isSpeaker) {
-        advGenes.set(slotId, {
-          sessionId: topPreference.sessionId,
-          slotId,
-          roomId: topPreference.roomId
-        });
-        pickedSessions.add(topPreference.sessionId);
+        if (reserve(adv.id, topPreference, advGenes)) {
+          pickedSessions.add(topPreference.sessionId);
+        } else {
+          const alt = options.find(o => canFit(o));
+          if (alt && reserve(adv.id, alt, advGenes)) {
+            pickedSessions.add(alt.sessionId);
+          }
+        }
       }
     });
 
@@ -1108,7 +1260,8 @@ export const solveSchedule = async (
     timeSlots,
     fixedInstances,
     roomsById,
-    slotsById
+    slotsById,
+    advisors
   );
 
   const presenterObligations = buildPresenterObligations(sessions, advisors, masterOptions);
@@ -1116,7 +1269,14 @@ export const solveSchedule = async (
   // 2. Initialize Population
   let population: Individual[] = [];
   for (let i = 0; i < GA_CONFIG.POPULATION_SIZE; i++) {
-    const ind = createRandomIndividual(advisors, masterOptions, sessions, slotsById, presenterObligations);
+    const ind = createRandomIndividual(
+      advisors,
+      masterOptions,
+      sessions,
+      slotsById,
+      presenterObligations,
+      roomsById
+    );
     calculateFitness(ind, advisors, sessions, roomsById, slotsById);
     population.push(ind);
   }
