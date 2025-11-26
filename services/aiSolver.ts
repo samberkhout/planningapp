@@ -58,6 +58,13 @@ interface Individual {
   instances: ScheduledInstance[];
 }
 
+interface PresenterObligation {
+  advId: number;
+  sessionId: number;
+  slotId: number;
+  roomId: string;
+}
+
 type MutationMode = 'MANDATORY_FIX' | 'CAPACITY_FIX' | 'FILL_SLOT' | 'RANDOM_SWAP';
 
 // ===================
@@ -96,6 +103,81 @@ const getStrictCapacity = (
 
   // Default to room capacity
   return room.capacity;
+};
+
+const normalizeName = (name: string) => name.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+const matchSpeakerToAdvisor = (speaker: string, advisor: Advisor): boolean => {
+  if (!speaker) return false;
+
+  const speakerParts = speaker
+    .split(/[/&+,]|\ben\b/i)
+    .map(p => normalizeName(p))
+    .filter(Boolean);
+
+  const advisorName = normalizeName(advisor.name);
+  return speakerParts.some(part => advisorName.includes(part));
+};
+
+const buildPresenterObligations = (
+  sessions: Session[],
+  advisors: Advisor[],
+  masterOptions: ScheduledInstance[]
+): Map<number, PresenterObligation[]> => {
+  const sessionsById = new Map(sessions.map(s => [s.id, s]));
+  const obligations = new Map<number, PresenterObligation[]>();
+
+  masterOptions.forEach(inst => {
+    const session = sessionsById.get(inst.sessionId);
+    if (!session || !session.speaker) return;
+
+    advisors.forEach(adv => {
+      if (matchSpeakerToAdvisor(session.speaker, adv)) {
+        const list = obligations.get(inst.slotId) ?? [];
+        const exists = list.some(o => o.advId === adv.id && o.sessionId === inst.sessionId);
+        if (!exists) {
+          list.push({ advId: adv.id, sessionId: inst.sessionId, slotId: inst.slotId, roomId: inst.roomId });
+        }
+        obligations.set(inst.slotId, list);
+      }
+    });
+  });
+
+  return obligations;
+};
+
+const enforcePresenterObligations = (
+  ind: Individual,
+  presenterObligations: Map<number, PresenterObligation[]>,
+  masterOptions: ScheduledInstance[]
+) => {
+  presenterObligations.forEach((list, slotId) => {
+    list.forEach(ob => {
+      let advGenes = ind.genome.get(ob.advId);
+      if (!advGenes) {
+        advGenes = new Map();
+        ind.genome.set(ob.advId, advGenes);
+      }
+
+      const targetInstance = masterOptions.find(
+        i => i.sessionId === ob.sessionId && i.slotId === ob.slotId && i.roomId === ob.roomId
+      );
+      if (!targetInstance) return;
+
+      advGenes.set(slotId, {
+        sessionId: targetInstance.sessionId,
+        slotId: targetInstance.slotId,
+        roomId: targetInstance.roomId
+      });
+
+      const existing = ind.instances.find(
+        i => i.sessionId === targetInstance.sessionId && i.slotId === targetInstance.slotId && i.roomId === targetInstance.roomId
+      );
+      if (existing && !existing.attendees.includes(ob.advId)) {
+        existing.attendees.push(ob.advId);
+      }
+    });
+  });
 };
 
 // ===================
@@ -279,8 +361,11 @@ const refineScheduleWithBulldozer = (
   sessions: Session[],
   masterOptions: ScheduledInstance[],
   roomsById: Map<string, Room>,
-  slotsById: Map<number, TimeSlot>
+  slotsById: Map<number, TimeSlot>,
+  presenterObligations: Map<number, PresenterObligation[]>
 ) => {
+  enforcePresenterObligations(ind, presenterObligations, masterOptions);
+
   const isBusy = (advId: number, slotId: number) => {
     const genes = ind.genome.get(advId);
     return genes ? genes.has(slotId) : false;
@@ -380,17 +465,19 @@ const refineScheduleWithBulldozer = (
         // 2. Kick out elective
         if (!assigned) {
           for (const inst of instances) {
-            const currentGene = ind.genome.get(adv.id)?.get(inst.slotId);
-            // We can overwrite if current is elective OR nothing
-            if (
-              !currentGene ||
-              sessions.find(s => s.id === currentGene.sessionId)?.type === SessionType.ELECTIVE
-            ) {
-              addGene(adv.id, inst);
-              assigned = true;
-              break;
-            }
+          const currentGene = ind.genome.get(adv.id)?.get(inst.slotId);
+          const hasPresenterConflict = presenterObligations.get(inst.slotId)?.some(o => o.advId === adv.id);
+          // We can overwrite if current is elective OR nothing and not conflicting with presenting
+          if (
+            !hasPresenterConflict &&
+            (!currentGene ||
+              sessions.find(s => s.id === currentGene.sessionId)?.type === SessionType.ELECTIVE)
+          ) {
+            addGene(adv.id, inst);
+            assigned = true;
+            break;
           }
+        }
         }
 
         // 3. Last resort - overwrite anything that isn't another mandatory
@@ -398,8 +485,10 @@ const refineScheduleWithBulldozer = (
            const inst = instances[0];
            const currentGene = ind.genome.get(adv.id)?.get(inst.slotId);
            const currentSession = currentGene ? sessions.find(s => s.id === currentGene.sessionId) : null;
-           
-           if (!currentSession || (currentSession.type !== SessionType.MANDATORY && currentSession.type !== SessionType.PLENARY)) {
+
+           const hasPresenterConflict = presenterObligations.get(inst.slotId)?.some(o => o.advId === adv.id);
+
+           if (!hasPresenterConflict && (!currentSession || (currentSession.type !== SessionType.MANDATORY && currentSession.type !== SessionType.PLENARY))) {
                addGene(adv.id, inst);
            }
         }
@@ -417,13 +506,8 @@ const refineScheduleWithBulldozer = (
 
     sessionSlots.forEach(slotId => {
       // Check if advisor is speaking in this slot
-      const isSpeaker = sessions.some(
-        s =>
-          s.speaker &&
-          s.speaker.toLowerCase().split(/[\/&+,]| en /i).some(part => adv.name.toLowerCase().includes(part.trim())) &&
-          ind.instances.some(i => i.sessionId === s.id && i.slotId === slotId)
-      );
-      if (isSpeaker) return;
+      const presenterConflict = presenterObligations.get(slotId)?.some(o => o.advId === adv.id);
+      if (presenterConflict) return;
 
       if (!genes.has(slotId)) {
         const possible = ind.instances.filter(i => i.slotId === slotId);
@@ -638,18 +722,39 @@ const createRandomIndividual = (
   advisors: Advisor[],
   masterOptions: ScheduledInstance[],
   sessions: Session[],
-  slotsById: Map<number, TimeSlot>
+  slotsById: Map<number, TimeSlot>,
+  presenterObligations: Map<number, PresenterObligation[]>
 ): Individual => {
   const genome: Genome = new Map();
   const sessionSlots = Array.from(slotsById.values())
     .filter(s => s.type === SlotType.SESSION)
     .map(s => s.id);
 
+  const obligationsByAdvisor = new Map<number, PresenterObligation[]>();
+  presenterObligations.forEach(list => {
+    list.forEach(ob => {
+      const existing = obligationsByAdvisor.get(ob.advId) ?? [];
+      existing.push(ob);
+      obligationsByAdvisor.set(ob.advId, existing);
+    });
+  });
+
   advisors.forEach(adv => {
     const advGenes = new Map<number, Gene>();
     const pickedSessions = new Set<number>();
 
+    const advObligations = obligationsByAdvisor.get(adv.id) ?? [];
+    advObligations.forEach(ob => {
+      advGenes.set(ob.slotId, {
+        sessionId: ob.sessionId,
+        slotId: ob.slotId,
+        roomId: ob.roomId
+      });
+      pickedSessions.add(ob.sessionId);
+    });
+
     sessionSlots.forEach(slotId => {
+      if (advGenes.has(slotId)) return;
       const options = masterOptions.filter(i => i.slotId === slotId);
       if (options.length > 0) {
         // Try to pick preference that hasn't been picked yet
@@ -748,9 +853,13 @@ const mutateIndividual = (
   roomsById: Map<string, Room>,
   slotsById: Map<number, TimeSlot>,
   masterOptions: ScheduledInstance[],
-  mutationRate: number
+  mutationRate: number,
+  presenterObligations: Map<number, PresenterObligation[]>
 ) => {
-  if (Math.random() > mutationRate) return;
+  if (Math.random() > mutationRate) {
+    enforcePresenterObligations(ind, presenterObligations, masterOptions);
+    return;
+  }
 
   calculateFitness(ind, advisors, sessions, roomsById, slotsById);
 
@@ -907,6 +1016,8 @@ const mutateIndividual = (
       break;
     }
   }
+
+  enforcePresenterObligations(ind, presenterObligations, masterOptions);
 };
 
 // ===================
@@ -919,9 +1030,10 @@ const localSearch = (
   sessions: Session[],
   masterOptions: ScheduledInstance[],
   roomsById: Map<string, Room>,
-  slotsById: Map<number, TimeSlot>
+  slotsById: Map<number, TimeSlot>,
+  presenterObligations: Map<number, PresenterObligation[]>
 ) => {
-  refineScheduleWithBulldozer(ind, advisors, sessions, masterOptions, roomsById, slotsById);
+  refineScheduleWithBulldozer(ind, advisors, sessions, masterOptions, roomsById, slotsById, presenterObligations);
   calculateFitness(ind, advisors, sessions, roomsById, slotsById);
 };
 
@@ -950,10 +1062,12 @@ export const solveSchedule = async (
     slotsById
   );
 
+  const presenterObligations = buildPresenterObligations(sessions, advisors, masterOptions);
+
   // 2. Initialize Population
   let population: Individual[] = [];
   for (let i = 0; i < GA_CONFIG.POPULATION_SIZE; i++) {
-    const ind = createRandomIndividual(advisors, masterOptions, sessions, slotsById);
+    const ind = createRandomIndividual(advisors, masterOptions, sessions, slotsById, presenterObligations);
     calculateFitness(ind, advisors, sessions, roomsById, slotsById);
     population.push(ind);
   }
@@ -974,7 +1088,7 @@ export const solveSchedule = async (
     population.sort((a, b) => b.fitness - a.fitness);
 
     for (let i = 0; i < Math.min(TOP_K_LOCAL_SEARCH, population.length); i++) {
-      localSearch(population[i], advisors, sessions, masterOptions, roomsById, slotsById);
+      localSearch(population[i], advisors, sessions, masterOptions, roomsById, slotsById, presenterObligations);
     }
 
     population.sort((a, b) => b.fitness - a.fitness);
@@ -1016,7 +1130,8 @@ export const solveSchedule = async (
         roomsById,
         slotsById,
         masterOptions,
-        currentMutationRate
+        currentMutationRate,
+        presenterObligations
       );
 
       calculateFitness(child, advisors, sessions, roomsById, slotsById);
@@ -1038,7 +1153,7 @@ export const solveSchedule = async (
     repairAttempts < SAFE_BREAK_LIMIT &&
     (best.stats.mandatoryMetPercent < 100 || best.stats.unfilledSlots > 0 || best.stats.capacityViolations > 0)
   ) {
-    refineScheduleWithBulldozer(best, advisors, sessions, masterOptions, roomsById, slotsById);
+    refineScheduleWithBulldozer(best, advisors, sessions, masterOptions, roomsById, slotsById, presenterObligations);
     calculateFitness(best, advisors, sessions, roomsById, slotsById);
 
     if (onProgress && repairAttempts % 5 === 0) {
