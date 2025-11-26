@@ -682,11 +682,13 @@ const calculateFitness = (
   advisors: Advisor[],
   sessions: Session[],
   roomsById: Map<string, Room>,
-  slotsById: Map<number, TimeSlot>
+  slotsById: Map<number, TimeSlot>,
+  presenterObligations: Map<number, PresenterObligation[]>
 ): number => {
   let score = 0;
 
   ind.stats = {
+    averagePreferenceRank: 0,
     mandatoryMetPercent: 0,
     capacityViolations: 0,
     unfilledSlots: 0,
@@ -695,11 +697,22 @@ const calculateFitness = (
     duplicatesFound: 0
   };
 
+  const obligationSlotsByAdvisor = new Map<number, Set<number>>();
+  presenterObligations.forEach(list => {
+    list.forEach(ob => {
+      const set = obligationSlotsByAdvisor.get(ob.advId) ?? new Set<number>();
+      set.add(ob.slotId);
+      obligationSlotsByAdvisor.set(ob.advId, set);
+    });
+  });
+
   let totalMandatoryNeeded = 0;
   let totalMandatoryMet = 0;
   let totalPreferences = 0;
   let metPreferences = 0;
   let filledSlots = 0;
+  let totalPreferenceRank = 0;
+  let matchedPreferenceCount = 0;
 
   // Include PLENARY in mandatory checks
   const mandatory = sessions.filter(s => s.type === SessionType.MANDATORY || s.type === SessionType.PLENARY);
@@ -714,11 +727,11 @@ const calculateFitness = (
     // Check for duplicates
     if (genes) {
       genes.forEach(g => {
-          if (attendingIds.has(g.sessionId)) {
-              score += GA_CONFIG.WEIGHTS.DUPLICATE_SESSION;
-              ind.stats.duplicatesFound++;
-          }
-          attendingIds.add(g.sessionId);
+        if (attendingIds.has(g.sessionId)) {
+          score += GA_CONFIG.WEIGHTS.DUPLICATE_SESSION;
+          ind.stats.duplicatesFound++;
+        }
+        attendingIds.add(g.sessionId);
       });
       filledSlots += genes.size;
     }
@@ -744,16 +757,23 @@ const calculateFitness = (
     const maxMatchable = Math.min(adv.preferences.length, possibleElectiveSlots);
     
     if (maxMatchable > 0) {
-        let personalMet = 0;
-        adv.preferences.forEach(p => {
-            if (attendingIds.has(p)) personalMet++;
-        });
-        
-        // Add to global counter relative to max possible
-        metPreferences += personalMet;
-        totalPreferences += maxMatchable; // Normalize against what was possible
-        
-        score += (personalMet * GA_CONFIG.WEIGHTS.PREFERENCE_MET);
+      let personalMet = 0;
+      adv.preferences.forEach(p => {
+        if (attendingIds.has(p)) personalMet++;
+      });
+
+      // Add to global counter relative to max possible
+      metPreferences += personalMet;
+      totalPreferences += maxMatchable; // Normalize against what was possible
+
+      score += personalMet * GA_CONFIG.WEIGHTS.PREFERENCE_MET;
+
+      adv.preferences.forEach((p, idx) => {
+        if (attendingIds.has(p)) {
+          totalPreferenceRank += idx + 1;
+          matchedPreferenceCount++;
+        }
+      });
     }
   });
 
@@ -776,28 +796,22 @@ const calculateFitness = (
   let actualUnfilled = 0;
   advisors.forEach(adv => {
     const genes = ind.genome.get(adv.id);
-    // Speaker logic: if speaker, they are 'busy' but no gene. 
-    // We assume masterOptions has speaker constraint handled or we count presenting as filled.
-    // For simplicity here, we just count genes. 
-    // Ideally we subtract slots where they present.
-    
-    const presentingCount = sessions.filter(s => 
-        s.speaker && s.speaker.toLowerCase().includes(adv.name.toLowerCase())
-    ).length; 
-    // This is rough, assumes 1 slot per presentation.
-    
-    const target = Math.max(0, sessionSlotsCount - presentingCount);
-    
-    if (genes && genes.size < target) {
-      actualUnfilled += (target - genes.size);
+    const obligationSlots = obligationSlotsByAdvisor.get(adv.id) ?? new Set<number>();
+    const geneCount = genes ? Array.from(genes.entries()).filter(([slotId]) => !obligationSlots.has(slotId)).length : 0;
+
+    const target = Math.max(0, sessionSlotsCount - obligationSlots.size);
+
+    if (geneCount < target) {
+      actualUnfilled += (target - geneCount);
     }
   });
-  
+
   ind.stats.unfilledSlots = actualUnfilled;
   if (actualUnfilled > 0) {
     score += actualUnfilled * GA_CONFIG.WEIGHTS.UNFILLED_SLOT;
   }
 
+  ind.stats.averagePreferenceRank = matchedPreferenceCount > 0 ? totalPreferenceRank / matchedPreferenceCount : 0;
   ind.stats.mandatoryMetPercent =
     totalMandatoryNeeded > 0 ? (totalMandatoryMet / totalMandatoryNeeded) * 100 : 100;
     
@@ -1038,7 +1052,7 @@ const mutateIndividual = (
     return;
   }
 
-  calculateFitness(ind, advisors, sessions, roomsById, slotsById);
+  calculateFitness(ind, advisors, sessions, roomsById, slotsById, presenterObligations);
 
   const overfullInstances = ind.instances.filter(inst => {
     const cap = getStrictCapacity(
@@ -1211,7 +1225,7 @@ const localSearch = (
   presenterObligations: Map<number, PresenterObligation[]>
 ) => {
   refineScheduleWithBulldozer(ind, advisors, sessions, masterOptions, roomsById, slotsById, presenterObligations);
-  calculateFitness(ind, advisors, sessions, roomsById, slotsById);
+  calculateFitness(ind, advisors, sessions, roomsById, slotsById, presenterObligations);
 };
 
 const isPerfectSchedule = (stats: any) => {
@@ -1277,7 +1291,7 @@ export const solveSchedule = async (
       presenterObligations,
       roomsById
     );
-    calculateFitness(ind, advisors, sessions, roomsById, slotsById);
+    calculateFitness(ind, advisors, sessions, roomsById, slotsById, presenterObligations);
     population.push(ind);
   }
 
@@ -1347,7 +1361,7 @@ export const solveSchedule = async (
         presenterObligations
       );
 
-      calculateFitness(child, advisors, sessions, roomsById, slotsById);
+      calculateFitness(child, advisors, sessions, roomsById, slotsById, presenterObligations);
       newPop.push(child);
     }
 
@@ -1364,10 +1378,15 @@ export const solveSchedule = async (
 
   while (
     repairAttempts < SAFE_BREAK_LIMIT &&
-    (best.stats.mandatoryMetPercent < 100 || best.stats.unfilledSlots > 0 || best.stats.capacityViolations > 0)
+    (
+      best.stats.mandatoryMetPercent < 100 ||
+      best.stats.unfilledSlots > 0 ||
+      best.stats.capacityViolations > 0 ||
+      best.stats.duplicatesFound > 0
+    )
   ) {
     refineScheduleWithBulldozer(best, advisors, sessions, masterOptions, roomsById, slotsById, presenterObligations);
-    calculateFitness(best, advisors, sessions, roomsById, slotsById);
+    calculateFitness(best, advisors, sessions, roomsById, slotsById, presenterObligations);
 
     if (onProgress && repairAttempts % 5 === 0) {
       onProgress({
