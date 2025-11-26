@@ -321,7 +321,8 @@ export const parseExcelFile = async (file: File): Promise<ParsedData> => {
                         }
                     }
                 }
-                advisors.push({ id, name: name.toString(), preferences });
+                const uniquePreferences = Array.from(new Set(preferences));
+                advisors.push({ id, name: name.toString(), preferences: uniquePreferences });
             }
         }
 
